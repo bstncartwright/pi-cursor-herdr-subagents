@@ -52,6 +52,7 @@ const CURSOR_CONFIG_PATH = join(homedir(), ".cursor", "cli-config.json");
 const MAX_SUBAGENTS = 8;
 const MAX_BUFFER_CHARS = 2 * 1024 * 1024;
 const UI_PROMPT_TIMEOUT_MS = 120_000;
+export const SUBAGENT_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 
 type ManagedStatus = "starting" | "working" | "ready" | "failed" | "stopped";
 
@@ -80,6 +81,7 @@ interface ManagedSubagent {
 	lastError?: string;
 	todos: Array<{ id?: string; content?: string; status?: string }>;
 	streamLabel?: "thought" | "assistant";
+	idleTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface RuntimeState {
@@ -657,7 +659,7 @@ function deliverResult(agent: ManagedSubagent, stopReason?: string): void {
 		"cursor_subagent_result",
 		[
 			`Cursor subagent "${agent.name}" completed turn ${agent.turn}${stopReason ? ` (${stopReason})` : ""}.`,
-			`It remains open for follow-ups. Use subagent action=send with target ${JSON.stringify(agent.id)}.`,
+			`It remains open for follow-ups for 15 minutes. Use subagent action=send with target ${JSON.stringify(agent.id)}, or subagent action=stop when no more follow-up is needed.`,
 			"",
 			output.text,
 		].join("\n"),
@@ -675,6 +677,22 @@ function deliverResult(agent: ManagedSubagent, stopReason?: string): void {
 			output: output.text,
 		},
 	);
+}
+
+function clearIdleTimer(agent: ManagedSubagent): void {
+	if (!agent.idleTimer) return;
+	clearTimeout(agent.idleTimer);
+	agent.idleTimer = undefined;
+}
+
+function scheduleIdleClose(agent: ManagedSubagent): void {
+	clearIdleTimer(agent);
+	agent.idleTimer = setTimeout(() => {
+		agent.idleTimer = undefined;
+		if (runtime.agents.get(agent.id) !== agent || agent.pending || agent.closing) return;
+		void stopSubagent(agent, "closed automatically after 15 minutes without a follow-up");
+	}, SUBAGENT_IDLE_TIMEOUT_MS);
+	agent.idleTimer.unref?.();
 }
 
 function deliverFailure(agent: ManagedSubagent, error: unknown): void {
@@ -696,6 +714,7 @@ function deliverFailure(agent: ManagedSubagent, error: unknown): void {
 function beginTurn(agent: ManagedSubagent, prompt: string): void {
 	if (agent.pending) throw new Error(`Cursor subagent ${JSON.stringify(agent.name)} is already working.`);
 	if (!agent.client.isAlive) throw new Error(`Cursor subagent ${JSON.stringify(agent.name)} is not running.`);
+	clearIdleTimer(agent);
 
 	agent.turn += 1;
 	agent.pending = true;
@@ -714,6 +733,7 @@ function beginTurn(agent: ManagedSubagent, prompt: string): void {
 			writeLog(agent, "turn", `completed${result.stopReason ? ` — ${result.stopReason}` : ""}`);
 			setActivity(agent, "ready", "ready for follow-up");
 			deliverResult(agent, result.stopReason);
+			scheduleIdleClose(agent);
 		})
 		.catch((error) => {
 			if (runtime.agents.get(agent.id) !== agent || agent.closing) return;
@@ -867,13 +887,14 @@ async function spawnSubagent(
 	}
 }
 
-async function stopSubagent(agent: ManagedSubagent): Promise<void> {
+async function stopSubagent(agent: ManagedSubagent, reason = "stopped by parent"): Promise<void> {
+	clearIdleTimer(agent);
 	agent.closing = true;
 	agent.status = "stopped";
 	agent.activity = "stopped";
 	runtime.agents.delete(agent.id);
 	endLogStream(agent);
-	writeLog(agent, "session", "stopped by parent");
+	writeLog(agent, "session", reason);
 	await Promise.allSettled([agent.client.close(), closeViewer(agent)]);
 	updateWidget();
 }
@@ -914,17 +935,18 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 		description:
 			"Manage interactive Cursor agents through ACP, with each agent visualized in a dedicated background Herdr event-viewer tab. " +
 			"Actions: spawn, send, list, read, stop. spawn and send return after submission; structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer. " +
-			"When a turn ends, the result is automatically steered back into Pi and the ACP session remains open for follow-ups. " +
+			"When a turn ends, the result is automatically steered back into Pi. The ACP session remains open for follow-ups for 15 minutes, then closes automatically. " +
 			"permissionMode defaults to prompt (Pi UI when available; otherwise reject). allow-once and deny are also supported; allow-always is never auto-selected. " +
 			"Models: Auto, or Grok 4.5 High with effort=high and Fast explicitly disabled. Returned output is capped at 2000 lines or 50KB.",
 		promptSnippet:
-			"Spawn and converse with Cursor ACP agents in Herdr. Completed turns are delivered automatically and sessions remain open for follow-ups.",
+			"Spawn and converse with Cursor ACP agents in Herdr. Completed turns are delivered automatically; stop sessions when finished, or they auto-close after 15 idle minutes.",
 		promptGuidelines: [
 			"Use subagent action=spawn to delegate independent work to Cursor ACP; choose only Auto or Grok 4.5 High.",
 			"Grok 4.5 High in subagent explicitly uses effort=high and fast=false; never substitute a Fast variant.",
 			"Default permissionMode is prompt so the user can approve or deny tool permissions in Pi; use allow-once or deny only when the user asks for that policy.",
 			"After subagent action=spawn or action=send, do not poll or sleep. The subagent tool automatically steers the completed turn back into Pi.",
 			"Use subagent action=send with the returned id for follow-ups; the same Cursor ACP session remains open.",
+			"After receiving a completed result, use subagent action=stop when no more follow-up is needed. Ready sessions also close automatically after 15 minutes without a follow-up.",
 			"Use subagent action=read only when the user asks to inspect the structured event log or when diagnosing a failed run.",
 		],
 		parameters: SubagentParams,

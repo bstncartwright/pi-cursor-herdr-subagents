@@ -11,7 +11,16 @@ import {
 	shellQuote,
 	summarize,
 	toolLabel,
+	SUBAGENT_IDLE_TIMEOUT_MS,
 } from "../extensions/index.ts";
+
+test("ready subagents use a 15-minute idle timeout", async () => {
+	assert.equal(SUBAGENT_IDLE_TIMEOUT_MS, 15 * 60 * 1000);
+	const { readFileSync } = await import("node:fs");
+	const source = readFileSync(new URL("../extensions/index.ts", import.meta.url), "utf8");
+	assert.match(source, /scheduleIdleClose\(agent\)/);
+	assert.match(source, /action=stop when no more follow-up is needed/);
+});
 
 test("shellQuote escapes single quotes for POSIX shells", () => {
 	assert.equal(shellQuote("plain"), "'plain'");

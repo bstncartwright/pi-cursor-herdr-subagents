@@ -2,7 +2,7 @@
 
 A [Pi](https://pi.dev) package that manages interactive [Cursor](https://cursor.com) agents over ACP, with each subagent visualized in a dedicated background [Herdr](https://herdr.dev) event-viewer tab.
 
-Spawn and follow-up return immediately after submission. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer (via `tail -F` on a private event log). A Pi widget tracks managed sessions. Cursor ACP sessions are **not** registered as Herdr agents and carry no agent badge/`display-agent` metadata — the viewer tab is named only via `tab create --label`. When a turn ends, the result is steered back into Pi and the ACP session stays open for follow-ups.
+Spawn and follow-up return immediately after submission. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer (via `tail -F` on a private event log). A Pi widget tracks managed sessions. Cursor ACP sessions are **not** registered as Herdr agents and carry no agent badge/`display-agent` metadata — the viewer tab is named only via `tab create --label`. When a turn ends, the result is steered back into Pi. Pi should stop the session when no more follow-up is needed; otherwise it stays open for follow-ups and closes automatically after 15 idle minutes.
 
 ## Prerequisites
 
@@ -85,6 +85,8 @@ Example prompts for the parent Pi agent:
 - “Stop subagent `reviewer`.”
 
 `spawn` and `send` return after submission. Do not poll; completed turns are delivered automatically via steered custom messages (`cursor_subagent_result` / `cursor_subagent_status`).
+
+After handling a completed result, the parent Pi agent should call `stop` if it does not need a follow-up. A ready session that receives no follow-up is automatically stopped after 15 minutes, terminating Cursor ACP and closing its Herdr viewer. Sending a follow-up clears the old timeout; a new 15-minute timeout starts when that turn completes.
 
 Event logs are stored under Pi’s agent directory with private modes (`0700` dirs / `0600` logs):
 
