@@ -6,9 +6,11 @@ import test from "node:test";
 import {
 	appendBounded,
 	contentText,
+	DEFAULT_CHECK_IN_MINUTES,
 	formatElapsed,
 	hasWorkingSubagents,
 	parseJson,
+	PARENT_HERDR_REASSERT_DELAY_MS,
 	shellQuote,
 	summarize,
 	toolLabel,
@@ -22,6 +24,24 @@ test("parent Pi stays working only while subagent turns are outstanding", () => 
 	assert.equal(hasWorkingSubagents([{ pending: false, status: "starting" }]), true);
 	assert.equal(hasWorkingSubagents([{ pending: false, status: "working" }]), true);
 	assert.equal(hasWorkingSubagents([{ pending: false, status: "failed" }]), false);
+});
+
+test("running turns request parent check-ins every five minutes by default", async () => {
+	assert.equal(DEFAULT_CHECK_IN_MINUTES, 5);
+	const { readFileSync } = await import("node:fs");
+	const source = readFileSync(new URL("../extensions/index.ts", import.meta.url), "utf8");
+	assert.match(source, /scheduleCheckIn\(agent\)/);
+	assert.match(source, /clearCheckInTimer\(agent\)/);
+	assert.match(source, /case "steer"/);
+	assert.match(source, /cursor_subagent_checkin/);
+});
+
+test("parent Herdr state is reasserted after Pi's idle debounce", async () => {
+	assert.ok(PARENT_HERDR_REASSERT_DELAY_MS > 250);
+	const { readFileSync } = await import("node:fs");
+	const source = readFileSync(new URL("../extensions/index.ts", import.meta.url), "utf8");
+	assert.match(source, /pi\.on\("agent_end"/);
+	assert.match(source, /syncParentHerdrState\(true\)/);
 });
 
 test("ready subagents use a 15-minute idle timeout", async () => {

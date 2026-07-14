@@ -5,6 +5,7 @@ import {
 	answeredAskQuestion,
 	applyCursorConfigRestore,
 	askQuestionPromptability,
+	cancelledPermissionResult,
 	findPermissionOptionId,
 	normalizeAskQuestions,
 	normalizePermissionMode,
@@ -13,6 +14,7 @@ import {
 	planCursorConfigRestore,
 	redactPermissionPayload,
 	rejectPermissionResult,
+	resolveAgentPermissionDecision,
 	resolveAutomaticPermission,
 	resolvePromptPermissionSelection,
 	restoreCursorConfigVerified,
@@ -31,11 +33,29 @@ const standardOptions = normalizePermissionOptions({
 	kind: "edit",
 });
 
-test("normalizePermissionMode defaults to prompt", () => {
-	assert.equal(normalizePermissionMode(undefined), "prompt");
+test("normalizePermissionMode defaults to parent agent approval", () => {
+	assert.equal(normalizePermissionMode(undefined), "agent");
+	assert.equal(normalizePermissionMode("agent"), "agent");
 	assert.equal(normalizePermissionMode("allow-once"), "allow-once");
 	assert.equal(normalizePermissionMode("deny"), "deny");
-	assert.equal(normalizePermissionMode("nope"), "prompt");
+	assert.equal(normalizePermissionMode("nope"), "agent");
+});
+
+test("Pi agent approval can only grant allow-once", () => {
+	assert.deepEqual(resolveAgentPermissionDecision("approve", standardOptions), {
+		outcome: { outcome: "selected", optionId: "allow-once" },
+	});
+	assert.deepEqual(resolveAgentPermissionDecision("reject", standardOptions), {
+		outcome: { outcome: "selected", optionId: "reject-once" },
+	});
+	assert.throws(
+		() => resolveAgentPermissionDecision("approve", [{ optionId: "allow-always" }]),
+		/offer an allow-once/,
+	);
+});
+
+test("turn interruption cancels permission without selecting an option", () => {
+	assert.deepEqual(cancelledPermissionResult(), { outcome: { outcome: "cancelled" } });
 });
 
 test("allow-once mode never auto-selects allow-always", () => {

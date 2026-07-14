@@ -2,7 +2,7 @@
 
 A [Pi](https://pi.dev) package that manages interactive [Cursor](https://cursor.com) agents over ACP, with each subagent visualized in a dedicated background [Herdr](https://herdr.dev) event-viewer tab.
 
-Spawn and follow-up return immediately after submission. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer (via `tail -F` on a private event log). A Pi widget tracks managed sessions, and the parent Pi pane remains `working` in Herdr while any subagent turn is outstanding. Cursor ACP sessions are **not** registered as Herdr agents and carry no agent badge/`display-agent` metadata — the viewer tab is named only via `tab create --label`. When a turn ends, the result is steered back into Pi. Pi should stop the session when no more follow-up is needed; otherwise it stays open for follow-ups and closes automatically after 15 idle minutes.
+Spawn and follow-up return immediately after submission. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer (via `tail -F` on a private event log). A Pi widget tracks managed sessions, and the parent Pi pane remains `working` in Herdr while any subagent turn is outstanding, including after Pi's own foreground turn has ended. Cursor ACP sessions are **not** registered as Herdr agents and carry no agent badge/`display-agent` metadata — the viewer tab is named only via `tab create --label`. When a turn ends, the result is steered back into Pi. Pi should stop the session when no more follow-up is needed; otherwise it stays open for follow-ups and closes automatically after 15 idle minutes.
 
 ## Prerequisites
 
@@ -55,21 +55,30 @@ The package registers a `subagent` tool (generic name kept for compatibility) wi
 |--------|---------|
 | `spawn` | Start a Cursor ACP session and Herdr viewer; submit the initial task |
 | `send` | Follow up on an existing session by id or exact display name |
-| `list` | List managed sessions (includes `permissionMode`) |
+| `steer` | Cancel an active turn, then immediately start a corrective prompt |
+| `list` | List managed sessions (includes `permissionMode` and pending approval ids) |
 | `read` | Read the structured event log (defaults to 200 lines) |
 | `stop` | Terminate the ACP session and close its Herdr viewer |
+| `approve` / `reject` | Answer a pending approval routed to the parent Pi agent |
 
 Models:
 
 - `Auto` (default)
 - `Grok 4.5 High` — sets `model=grok-4.5`, `effort=high`, and `fast=false`
 
+### Parent check-ins and steering
+
+Each spawn has a `checkInMinutes` setting. It defaults to `5`; set it to `0` to disable or to an integer from `1` through `60` to change the interval. While a turn remains active, each interval steers a message to the parent Pi agent asking it to read that subagent's event log. Pi can let the turn continue, stop it, or use `action=steer` with a corrective message.
+
+`action=steer` sends ACP `session/cancel`, suppresses the interrupted turn's normal result, and starts the corrective prompt after Cursor acknowledges cancellation. Use `send` for a ready subagent and `steer` only for one that is currently working.
+
 ### Permission modes
 
-`permissionMode` is set per `spawn` (default **`prompt`**):
+`permissionMode` is set per `spawn` (default **`agent`**):
 
 | Mode | Behavior |
 |------|----------|
+| `agent` | **Default.** Steer the request to the parent Pi agent. Pi must call `subagent action=approve` or `action=reject` with the supplied approval id. Approval selects only `allow-once`; persistent approval is impossible through this flow. Requests time out and reject after two minutes. |
 | `prompt` | Ask via Pi UI when `hasUI` is available. Cancel / timeout / non-UI rejects via offered `reject-once`, or `cancelled` if that option is absent. `allow-always` is never auto-selected; the user may still choose it explicitly in the UI. |
 | `allow-once` | Automatically select `allow-once` when offered (never `allow-always`). |
 | `deny` | Automatically select `reject-once` when offered, otherwise `cancelled`. |
@@ -80,7 +89,9 @@ Example prompts for the parent Pi agent:
 
 - “Spawn a Cursor subagent named `reviewer` to review the current diff.”
 - “Spawn a Cursor subagent with permissionMode deny for a read-only check.”
+- “Spawn a Cursor subagent with permissionMode agent and decide its approval requests.”
 - “Send follow-up to subagent `reviewer`: also check the tests.”
+- “Steer subagent `reviewer`: stop editing the shared file and only review the diff.”
 - “List Cursor subagents.”
 - “Stop subagent `reviewer`.”
 
@@ -104,7 +115,8 @@ Additional notes:
 
 - Temporarily snapshots and restores `~/.cursor/cli-config.json` around ACP startup so model selection does not permanently change your Cursor CLI defaults. If the file did not exist beforehand, a file created during startup is removed on restore. Restoration **applies, waits briefly, and verifies** (original content or absence), retrying about **5** times before throwing an error that names the config path.
 - **Config race limitation:** restores are serialized inside this extension and verified with retries, but other Cursor/CLI processes can still rewrite `cli-config.json` concurrently and cause restore verification to fail. Treat that file as shared mutable state.
-- Default `permissionMode=prompt` requires interactive approval when Pi UI is available; non-UI contexts reject rather than auto-allow.
+- Default `permissionMode=agent` asks the parent model to approve once or reject. Existing sessions keep the mode they were spawned with.
+- `permissionMode=agent` delegates each decision to the parent model. Treat it as less restrictive than human `prompt`; although it cannot grant persistent access, an approved Cursor operation still runs with your full system permissions.
 - Plan-creation requests (`cursor/create_plan`) are still auto-accepted so planning turns can proceed; review plans in the Herdr viewer / final result.
 
 Only install from sources you trust. Review the extension code before enabling it on sensitive repositories.
@@ -117,7 +129,7 @@ Only install from sources you trust. Review the extension code before enabling i
 | `HERDR_WORKSPACE_ID is unavailable` | Confirm Herdr injected workspace env; run `herdr pane current --current` |
 | `herdr CLI is unavailable` | Ensure `herdr` is on `PATH` (`herdr --version`) |
 | `Cursor agent CLI is unavailable` | Ensure `agent` is on `PATH` (`agent --version`) and you are logged in |
-| Permissions always rejected | Need Pi UI (`hasUI`) for `prompt`, or pass `permissionMode=allow-once` intentionally |
+| Permissions always rejected | Need Pi UI (`hasUI`) for human `prompt`, use `permissionMode=agent` for parent-agent decisions, or pass `permissionMode=allow-once` intentionally |
 | Duplicate / unexpected subagent tool | Remove `~/.pi/agent/extensions/cursor-herdr-subagents/` and reload |
 | Grok High config rejected / Fast forced | This package requests Cursor’s `parameterizedModelPicker` capability and asserts `fast=false`; update Cursor CLI if options are missing |
 | Viewer tab empty | Check the event log path returned by `spawn` / `list`; Herdr runs `tail -F` on that file |

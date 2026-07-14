@@ -76,8 +76,12 @@ test("CursorAcpClient starts Auto model against a mock ACP process", async () =>
 		assert.equal(client.isAlive, true);
 		assert.equal(client.activeSessionId, "sess_test_1");
 
-		const result = await client.prompt("hi");
+		const result = await client.prompt("hi") as {
+			stopReason?: string;
+			permissionOutcome?: { outcome?: string; optionId?: string };
+		};
 		assert.equal(result.stopReason, "end_turn");
+		assert.deepEqual(result.permissionOutcome, { outcome: "selected", optionId: "allow-once" });
 		assert.ok(notifications.some((message) => message.method === "session/update"));
 		assert.ok(requests.some((message) => message.method === "session/request_permission"));
 	} finally {
@@ -118,6 +122,28 @@ test("CursorAcpClient rejects starting twice", async () => {
 	try {
 		await client.start("Auto");
 		await assert.rejects(() => client.start("Auto"), /already started/);
+	} finally {
+		await client.close();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("CursorAcpClient cancels an active turn and can prompt again", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-cursor-acp-"));
+	const client = new CursorAcpClient(cwd, {
+		agentCommand: process.execPath,
+		agentArgs: [mockAgent],
+		env: { PATH: process.env.PATH ?? "" },
+		requestTimeoutMs: 5_000,
+	});
+
+	try {
+		await client.start("Auto");
+		const pending = client.prompt("wait-for-cancel");
+		client.cancel();
+		assert.equal((await pending).stopReason, "cancelled");
+		assert.equal(client.isAlive, true);
+		assert.equal((await client.prompt("after cancellation")).stopReason, "end_turn");
 	} finally {
 		await client.close();
 		await rm(cwd, { recursive: true, force: true });

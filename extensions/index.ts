@@ -30,13 +30,17 @@ import {
 } from "./acp.ts";
 import {
 	answeredAskQuestion,
+	ALLOW_ONCE_IDS,
 	askQuestionPromptability,
+	cancelledPermissionResult,
+	findPermissionOptionId,
 	normalizeAskQuestions,
 	normalizePermissionMode,
 	normalizePermissionOptions,
 	permissionSelectLabels,
 	redactPermissionPayload,
 	rejectPermissionResult,
+	resolveAgentPermissionDecision,
 	resolveAutomaticPermission,
 	resolvePromptPermissionSelection,
 	restoreCursorConfigVerified,
@@ -54,8 +58,19 @@ const MAX_SUBAGENTS = 8;
 const MAX_BUFFER_CHARS = 2 * 1024 * 1024;
 const UI_PROMPT_TIMEOUT_MS = 120_000;
 export const SUBAGENT_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+export const DEFAULT_CHECK_IN_MINUTES = 5;
+/** Herdr's Pi integration publishes idle 250ms after agent_end; reassert after it. */
+export const PARENT_HERDR_REASSERT_DELAY_MS = 500;
 
 type ManagedStatus = "starting" | "working" | "ready" | "failed" | "stopped";
+
+interface PendingApproval {
+	id: string;
+	options: ReturnType<typeof normalizePermissionOptions>;
+	summary: string;
+	resolve: (result: unknown) => void;
+	timer: ReturnType<typeof setTimeout>;
+}
 
 interface ManagedSubagent {
 	id: string;
@@ -83,6 +98,10 @@ interface ManagedSubagent {
 	todos: Array<{ id?: string; content?: string; status?: string }>;
 	streamLabel?: "thought" | "assistant";
 	idleTimer?: ReturnType<typeof setTimeout>;
+	pendingApprovals: Map<string, PendingApproval>;
+	checkInMinutes: number;
+	checkInTimer?: ReturnType<typeof setTimeout>;
+	queuedSteer?: string;
 }
 
 interface RuntimeState {
@@ -97,6 +116,7 @@ interface RuntimeState {
 	parentHerdrQueue: Promise<void>;
 	parentHerdrWorking: boolean;
 	parentHerdrSeq: number;
+	parentHerdrReassertTimer?: ReturnType<typeof setTimeout>;
 }
 
 const runtime: RuntimeState =
@@ -115,6 +135,10 @@ if (!runtime.uiQueue) runtime.uiQueue = Promise.resolve();
 if (!runtime.parentHerdrQueue) runtime.parentHerdrQueue = Promise.resolve();
 if (runtime.parentHerdrWorking === undefined) runtime.parentHerdrWorking = false;
 if (!runtime.parentHerdrSeq) runtime.parentHerdrSeq = Date.now() * 1000;
+if (runtime.parentHerdrReassertTimer) {
+	clearTimeout(runtime.parentHerdrReassertTimer);
+	runtime.parentHerdrReassertTimer = undefined;
+}
 
 if (runtime.widgetTimer) {
 	clearInterval(runtime.widgetTimer);
@@ -124,10 +148,15 @@ if (runtime.widgetDebounce) {
 	clearTimeout(runtime.widgetDebounce);
 	runtime.widgetDebounce = undefined;
 }
+for (const agent of runtime.agents.values()) {
+	if (agent.checkInTimer) clearTimeout(agent.checkInTimer);
+	agent.checkInTimer = undefined;
+	agent.checkInMinutes ??= DEFAULT_CHECK_IN_MINUTES;
+}
 
-const ActionSchema = StringEnum(["spawn", "send", "list", "read", "stop"] as const, {
+const ActionSchema = StringEnum(["spawn", "send", "steer", "list", "read", "stop", "approve", "reject"] as const, {
 	description:
-		"spawn starts a Cursor ACP session; send submits a follow-up; list shows sessions; read returns the structured event log; stop terminates the session and closes its Herdr viewer.",
+		"spawn starts a Cursor ACP session; send submits a follow-up; steer cancels an active turn and starts a corrective prompt; list shows sessions; read returns the structured event log; stop terminates the session and closes its Herdr viewer; approve or reject answers a pending Cursor ACP approval request.",
 });
 
 const ModelSchema = StringEnum(["Auto", "Grok 4.5 High"] as const, {
@@ -135,10 +164,10 @@ const ModelSchema = StringEnum(["Auto", "Grok 4.5 High"] as const, {
 	default: "Auto",
 });
 
-const PermissionModeSchema = StringEnum(["prompt", "allow-once", "deny"] as const, {
+const PermissionModeSchema = StringEnum(["prompt", "agent", "allow-once", "deny"] as const, {
 	description:
-		"How session/request_permission is handled. prompt (default) asks via Pi UI when available; allow-once auto-approves once; deny rejects. allow-always is never auto-selected.",
-	default: "prompt",
+		"How session/request_permission is handled. agent (default) asks the parent Pi agent to call approve or reject; prompt asks the user via Pi UI; allow-once auto-approves once; deny rejects. Agent approval can only grant once.",
+	default: "agent",
 });
 
 const SubagentParams = Type.Object({
@@ -147,13 +176,23 @@ const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Initial task for action=spawn" })),
 	model: Type.Optional(ModelSchema),
 	permissionMode: Type.Optional(PermissionModeSchema),
+	checkInMinutes: Type.Optional(
+		Type.Integer({
+			description: "Minutes before each parent Pi check-in while a turn is running. Defaults to 5; 0 disables.",
+			minimum: 0,
+			maximum: 60,
+		}),
+	),
 	cwd: Type.Optional(
 		Type.String({ description: "Working directory for action=spawn. Defaults to the current Pi cwd." }),
 	),
 	target: Type.Optional(
-		Type.String({ description: "Subagent id or exact display name for send, read, or stop" }),
+		Type.String({ description: "Subagent id or exact display name for send, steer, read, stop, approve, or reject" }),
 	),
-	message: Type.Optional(Type.String({ description: "Follow-up message for action=send" })),
+	message: Type.Optional(Type.String({ description: "Follow-up message for action=send or corrective prompt for action=steer" })),
+	approvalId: Type.Optional(
+		Type.String({ description: "Pending approval id for action=approve or action=reject" }),
+	),
 	lines: Type.Optional(
 		Type.Integer({ description: "Log lines for action=read. Defaults to 200.", minimum: 20, maximum: 1000 }),
 	),
@@ -408,7 +447,11 @@ function stopWidgetTimer(): void {
 }
 
 function sendAsyncMessage(
-	customType: "cursor_subagent_result" | "cursor_subagent_status",
+	customType:
+		| "cursor_subagent_result"
+		| "cursor_subagent_status"
+		| "cursor_subagent_approval"
+		| "cursor_subagent_checkin",
 	content: string,
 	details: Record<string, unknown>,
 ): void {
@@ -418,6 +461,89 @@ function sendAsyncMessage(
 		{ customType, content, display: true, details },
 		{ triggerTurn: true, deliverAs: "steer" },
 	);
+}
+
+function clearCheckInTimer(agent: ManagedSubagent): void {
+	if (!agent.checkInTimer) return;
+	clearTimeout(agent.checkInTimer);
+	agent.checkInTimer = undefined;
+}
+
+function scheduleCheckIn(agent: ManagedSubagent): void {
+	clearCheckInTimer(agent);
+	const minutes = agent.checkInMinutes ?? DEFAULT_CHECK_IN_MINUTES;
+	if (minutes <= 0 || !agent.pending || agent.closing) return;
+	const turn = agent.turn;
+	agent.checkInTimer = setTimeout(() => {
+		agent.checkInTimer = undefined;
+		if (
+			runtime.agents.get(agent.id) !== agent ||
+			agent.closing ||
+			!agent.pending ||
+			agent.turn !== turn
+		) return;
+		writeLog(agent, "check-in", `requested after ${minutes} minute(s)`);
+		sendAsyncMessage(
+			"cursor_subagent_checkin",
+			[
+				`Cursor subagent "${agent.name}" [${agent.id}] has been running turn ${turn} for ${minutes} minute${minutes === 1 ? "" : "s"}. Check on it now.`,
+				`Use subagent action=read with target ${JSON.stringify(agent.id)} to inspect its event log.`,
+				`If it needs immediate correction, call subagent action=steer with target ${JSON.stringify(agent.id)} and a corrective message; this cancels the active turn before starting the correction. You may instead call action=stop. If it looks fine, let it continue.`,
+			].join("\n"),
+			{
+				id: agent.id,
+				name: agent.name,
+				turn,
+				minutes,
+				logPath: agent.logPath,
+			},
+		);
+		scheduleCheckIn(agent);
+	}, minutes * 60 * 1000);
+	agent.checkInTimer.unref?.();
+}
+
+function approvalMap(agent: ManagedSubagent): Map<string, PendingApproval> {
+	// Preserve compatibility with managed sessions retained across an extension reload.
+	return agent.pendingApprovals ?? (agent.pendingApprovals = new Map());
+}
+
+function resolvePendingApproval(
+	agent: ManagedSubagent,
+	approvalId: string | undefined,
+	decision: "approve" | "reject",
+): PendingApproval {
+	const id = approvalId?.trim();
+	if (!id) throw new Error(`action=${decision} requires approvalId.`);
+	const pending = approvalMap(agent).get(id);
+	if (!pending) {
+		throw new Error(`No pending approval ${JSON.stringify(id)} exists for subagent ${JSON.stringify(agent.name)}.`);
+	}
+	const result = resolveAgentPermissionDecision(decision, pending.options);
+	clearTimeout(pending.timer);
+	approvalMap(agent).delete(id);
+	pending.resolve(result);
+	writeLog(agent, "permission", `Pi agent ${decision}ed ${id}`);
+	setActivity(agent, "working", decision === "approve" ? "permission granted once" : "permission denied");
+	return pending;
+}
+
+function rejectAllPendingApprovals(agent: ManagedSubagent, reason: string): void {
+	for (const pending of approvalMap(agent).values()) {
+		clearTimeout(pending.timer);
+		pending.resolve(rejectPermissionResult(pending.options));
+		writeLog(agent, "permission", `${pending.id} rejected (${reason})`);
+	}
+	approvalMap(agent).clear();
+}
+
+function cancelAllPendingApprovals(agent: ManagedSubagent, reason: string): void {
+	for (const pending of approvalMap(agent).values()) {
+		clearTimeout(pending.timer);
+		pending.resolve(cancelledPermissionResult());
+		writeLog(agent, "permission", `${pending.id} cancelled (${reason})`);
+	}
+	approvalMap(agent).clear();
 }
 
 function boundedOutput(output: string): { text: string; truncated: boolean } {
@@ -449,12 +575,12 @@ export function hasWorkingSubagents(
 }
 
 /** Keep the parent Pi pane working while asynchronous subagent turns are outstanding. */
-function syncParentHerdrState(): void {
+function syncParentHerdrState(force = false): void {
 	const paneId = process.env.HERDR_PANE_ID;
 	if (!runtime.pi || !paneId || process.env.HERDR_ENV !== "1") return;
 
 	const working = hasWorkingSubagents(runtime.agents.values());
-	if (working === runtime.parentHerdrWorking) return;
+	if (!force && working === runtime.parentHerdrWorking) return;
 	runtime.parentHerdrWorking = working;
 	const seq = ++runtime.parentHerdrSeq;
 	const args = working
@@ -476,6 +602,20 @@ function syncParentHerdrState(): void {
 	runtime.parentHerdrQueue = runtime.parentHerdrQueue
 		.then(() => execHerdr(args).then(() => undefined))
 		.catch(() => undefined);
+}
+
+/**
+ * Pi's built-in Herdr lifecycle hook reports idle shortly after the parent turn
+ * ends. That newer report wins across Herdr authority sources, so publish our
+ * outstanding-subagent state once the built-in idle debounce has elapsed.
+ */
+function scheduleParentHerdrReassert(): void {
+	if (runtime.parentHerdrReassertTimer) clearTimeout(runtime.parentHerdrReassertTimer);
+	runtime.parentHerdrReassertTimer = setTimeout(() => {
+		runtime.parentHerdrReassertTimer = undefined;
+		if (hasWorkingSubagents(runtime.agents.values())) syncParentHerdrState(true);
+	}, PARENT_HERDR_REASSERT_DELAY_MS);
+	runtime.parentHerdrReassertTimer.unref?.();
 }
 
 export function contentText(content: unknown): string {
@@ -574,9 +714,10 @@ function handleNotification(agent: ManagedSubagent, message: JsonRpcMessage): vo
 
 async function handlePermissionRequest(agent: ManagedSubagent, params: unknown): Promise<unknown> {
 	const options = normalizePermissionOptions(params);
-	writeLog(agent, "permission", redactPermissionPayload(params));
+	const summary = redactPermissionPayload(params);
+	writeLog(agent, "permission", summary);
 
-	if (agent.permissionMode !== "prompt") {
+	if (agent.permissionMode === "allow-once" || agent.permissionMode === "deny") {
 		const result = resolveAutomaticPermission(agent.permissionMode, options);
 		const selected =
 			result.outcome.outcome === "selected" ? result.outcome.optionId : "cancelled";
@@ -587,6 +728,41 @@ async function handlePermissionRequest(agent: ManagedSubagent, params: unknown):
 			agent.permissionMode === "allow-once" ? "permission allowed once" : "permission denied",
 		);
 		return result;
+	}
+
+	if (agent.permissionMode === "agent") {
+		const approvalId = randomUUID().slice(0, 8);
+		const allowOnceOffered = !!findPermissionOptionId(options, ALLOW_ONCE_IDS);
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => {
+				const pending = approvalMap(agent).get(approvalId);
+				if (!pending) return;
+				approvalMap(agent).delete(approvalId);
+				resolve(rejectPermissionResult(options));
+				writeLog(agent, "permission", `${approvalId} rejected (Pi agent response timed out)`);
+				setActivity(agent, "working", "permission denied");
+			}, UI_PROMPT_TIMEOUT_MS);
+			timer.unref?.();
+			approvalMap(agent).set(approvalId, { id: approvalId, options, summary, resolve, timer });
+			setActivity(agent, "working", "awaiting Pi approval");
+			sendAsyncMessage(
+				"cursor_subagent_approval",
+				[
+					`Cursor subagent "${agent.name}" [${agent.id}] requests permission: ${summary}.`,
+					allowOnceOffered
+						? `To grant this operation exactly once, call subagent action=approve with target ${JSON.stringify(agent.id)} and approvalId ${JSON.stringify(approvalId)}. To deny it, call action=reject with the same target and approvalId.`
+						: `Cursor did not offer allow-once. Call subagent action=reject with target ${JSON.stringify(agent.id)} and approvalId ${JSON.stringify(approvalId)}.`,
+					"Do not claim the operation was approved without calling the tool. Persistent approval is unavailable.",
+				].join("\n"),
+				{
+					id: agent.id,
+					name: agent.name,
+					approvalId,
+					summary,
+					allowOnceOffered,
+				},
+			);
+		});
 	}
 
 	const ctx = runtime.ctx;
@@ -759,10 +935,29 @@ function deliverFailure(agent: ManagedSubagent, error: unknown): void {
 	);
 }
 
+function beginQueuedSteer(agent: ManagedSubagent, previousOutcome: string): boolean {
+	const prompt = agent.queuedSteer;
+	if (!prompt) return false;
+	agent.queuedSteer = undefined;
+	agent.pending = false;
+	writeLog(agent, "steer", `previous turn ended (${previousOutcome}); starting corrective prompt`);
+	setActivity(agent, "ready", "starting correction");
+	try {
+		beginTurn(agent, prompt);
+	} catch (error) {
+		writeLog(agent, "steer error", error instanceof Error ? error.message : String(error));
+		setActivity(agent, "failed", "steer failed");
+		syncParentHerdrState();
+		deliverFailure(agent, error);
+	}
+	return true;
+}
+
 function beginTurn(agent: ManagedSubagent, prompt: string): void {
 	if (agent.pending) throw new Error(`Cursor subagent ${JSON.stringify(agent.name)} is already working.`);
 	if (!agent.client.isAlive) throw new Error(`Cursor subagent ${JSON.stringify(agent.name)} is not running.`);
 	clearIdleTimer(agent);
+	clearCheckInTimer(agent);
 
 	agent.turn += 1;
 	agent.pending = true;
@@ -772,12 +967,15 @@ function beginTurn(agent: ManagedSubagent, prompt: string): void {
 	writeLog(agent, "user", prompt);
 	setActivity(agent, "working", "starting turn");
 	syncParentHerdrState();
+	scheduleCheckIn(agent);
 
 	agent.client
 		.prompt(prompt)
 		.then((result) => {
 			if (runtime.agents.get(agent.id) !== agent || agent.closing) return;
 			endLogStream(agent);
+			clearCheckInTimer(agent);
+			if (beginQueuedSteer(agent, result.stopReason ?? "completed")) return;
 			agent.pending = false;
 			writeLog(agent, "turn", `completed${result.stopReason ? ` — ${result.stopReason}` : ""}`);
 			setActivity(agent, "ready", "ready for follow-up");
@@ -788,6 +986,8 @@ function beginTurn(agent: ManagedSubagent, prompt: string): void {
 		.catch((error) => {
 			if (runtime.agents.get(agent.id) !== agent || agent.closing) return;
 			endLogStream(agent);
+			clearCheckInTimer(agent);
+			if (beginQueuedSteer(agent, error?.message ?? "cancelled with error")) return;
 			agent.pending = false;
 			writeLog(agent, "error", error?.message ?? String(error));
 			setActivity(agent, "failed", "failed");
@@ -842,6 +1042,7 @@ async function spawnSubagent(
 		model?: CursorModel;
 		cwd?: string;
 		permissionMode?: PermissionMode;
+		checkInMinutes?: number;
 	},
 	ctx: ExtensionContext,
 ): Promise<ManagedSubagent> {
@@ -861,6 +1062,7 @@ async function spawnSubagent(
 	const id = randomUUID().slice(0, 8);
 	const model = params.model ?? "Auto";
 	const permissionMode = normalizePermissionMode(params.permissionMode);
+	const checkInMinutes = params.checkInMinutes ?? DEFAULT_CHECK_IN_MINUTES;
 	const cwd = resolveCwd(params.cwd, ctx.cwd);
 	ensurePrivateStateDir(STATE_ROOT);
 	const stateDir = join(STATE_ROOT, id);
@@ -872,6 +1074,7 @@ async function spawnSubagent(
 			`Cursor ACP subagent: ${name} [${id}]`,
 			`Model: ${model}${model === "Grok 4.5 High" ? " (effort=high, fast=false)" : ""}`,
 			`Permission mode: ${permissionMode}`,
+			`Parent check-in: ${checkInMinutes === 0 ? "disabled" : `every ${checkInMinutes} minute(s)`}`,
 			`Working directory: ${cwd}`,
 			"",
 		].join("\n"),
@@ -888,6 +1091,9 @@ async function spawnSubagent(
 		onExit: (code, signal) => {
 			if (!agent || agent.closing || runtime.agents.get(agent.id) !== agent) return;
 			agent.pending = false;
+			clearCheckInTimer(agent);
+			agent.queuedSteer = undefined;
+			rejectAllPendingApprovals(agent, "ACP process exited");
 			writeLog(agent, "process", `exited (${code ?? signal ?? "unknown"})`);
 			setActivity(agent, "failed", "ACP process exited");
 			syncParentHerdrState();
@@ -916,6 +1122,8 @@ async function spawnSubagent(
 		currentThought: "",
 		currentOutput: "",
 		todos: [],
+		pendingApprovals: new Map(),
+		checkInMinutes,
 	};
 	runtime.agents.set(id, agent);
 	startWidgetTimer();
@@ -941,9 +1149,12 @@ async function spawnSubagent(
 
 async function stopSubagent(agent: ManagedSubagent, reason = "stopped by parent"): Promise<void> {
 	clearIdleTimer(agent);
+	clearCheckInTimer(agent);
 	agent.closing = true;
+	agent.queuedSteer = undefined;
 	agent.status = "stopped";
 	agent.activity = "stopped";
+	rejectAllPendingApprovals(agent, reason);
 	runtime.agents.delete(agent.id);
 	syncParentHerdrState();
 	endLogStream(agent);
@@ -965,6 +1176,14 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 		runtime.ctx = ctx;
 		if (runtime.agents.size > 0) startWidgetTimer();
 		updateWidget();
+		for (const agent of runtime.agents.values()) {
+			if (agent.pending) scheduleCheckIn(agent);
+		}
+		if (hasWorkingSubagents(runtime.agents.values())) scheduleParentHerdrReassert();
+	});
+
+	pi.on("agent_end", () => {
+		if (hasWorkingSubagents(runtime.agents.values())) scheduleParentHerdrReassert();
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -972,6 +1191,10 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 		if (runtime.widgetDebounce) {
 			clearTimeout(runtime.widgetDebounce);
 			runtime.widgetDebounce = undefined;
+		}
+		if (runtime.parentHerdrReassertTimer) {
+			clearTimeout(runtime.parentHerdrReassertTimer);
+			runtime.parentHerdrReassertTimer = undefined;
 		}
 		if (ctx.mode === "tui") ctx.ui.setWidget(WIDGET_KEY, undefined);
 		runtime.ctx = undefined;
@@ -987,16 +1210,19 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 		label: "Cursor Subagent",
 		description:
 			"Manage interactive Cursor agents through ACP, with each agent visualized in a dedicated background Herdr event-viewer tab. " +
-			"Actions: spawn, send, list, read, stop. spawn and send return after submission; structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer. " +
+			"Actions: spawn, send, steer, list, read, stop, approve, reject. spawn and send return after submission; steer cancels an active turn and starts a corrective prompt. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer. " +
 			"When a turn ends, the result is automatically steered back into Pi. The ACP session remains open for follow-ups for 15 minutes, then closes automatically. " +
-			"permissionMode defaults to prompt (Pi UI when available; otherwise reject). allow-once and deny are also supported; allow-always is never auto-selected. " +
+			"While a turn runs, checkInMinutes defaults to 5 and periodically steers a request for the parent Pi agent to inspect it; 0 disables check-ins. " +
+			"permissionMode defaults to agent, which routes each request back to the parent Pi agent to approve once or reject. Human Pi UI prompt, automatic allow-once, and deny modes are also supported. " +
 			"Models: Auto, or Grok 4.5 High with effort=high and Fast explicitly disabled. Returned output is capped at 2000 lines or 50KB.",
 		promptSnippet:
 			"Spawn and converse with Cursor ACP agents in Herdr. Completed turns are delivered automatically; stop sessions when finished, or they auto-close after 15 idle minutes.",
 		promptGuidelines: [
 			"Use subagent action=spawn to delegate independent work to Cursor ACP; choose only Auto or Grok 4.5 High.",
 			"Grok 4.5 High in subagent explicitly uses effort=high and fast=false; never substitute a Fast variant.",
-			"Default permissionMode is prompt so the user can approve or deny tool permissions in Pi; use allow-once or deny only when the user asks for that policy.",
+			"Default permissionMode is agent, so respond to each cursor_subagent_approval with subagent action=approve or action=reject. Use prompt for human Pi UI approval, or automatic allow-once/deny only when the user requests that policy.",
+			"When subagent permissionMode=agent sends a cursor_subagent_approval message, inspect its operation and promptly call subagent action=approve or action=reject with the exact target and approvalId. Agent approval is allow-once only.",
+			"When a cursor_subagent_checkin message arrives, use subagent action=read for that target and inspect the event log. If correction is needed, use action=steer with a corrective message to cancel and redirect the active turn, or action=stop; otherwise let it continue.",
 			"After subagent action=spawn or action=send, do not poll or sleep. The subagent tool automatically steers the completed turn back into Pi.",
 			"Use subagent action=send with the returned id for follow-ups; the same Cursor ACP session remains open.",
 			"After receiving a completed result, use subagent action=stop when no more follow-up is needed. Ready sessions also close automatically after 15 minutes without a follow-up.",
@@ -1025,6 +1251,7 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 							name: agent.name,
 							model: agent.model,
 							permissionMode: agent.permissionMode,
+							checkInMinutes: agent.checkInMinutes,
 							sessionId: agent.sessionId,
 							viewerPaneId: agent.viewerPaneId,
 							viewerTabId: agent.viewerTabId,
@@ -1055,14 +1282,49 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 					};
 				}
 
+				case "steer": {
+					const agent = resolveTarget(params.target);
+					const message = params.message?.trim();
+					if (!message) throw new Error("action=steer requires message.");
+					if (!agent.pending) {
+						throw new Error(`Cursor subagent ${JSON.stringify(agent.name)} is not currently working; use action=send.`);
+					}
+					if (agent.queuedSteer) {
+						throw new Error(`Cursor subagent ${JSON.stringify(agent.name)} already has a corrective steer queued.`);
+					}
+					agent.queuedSteer = message;
+					clearCheckInTimer(agent);
+					cancelAllPendingApprovals(agent, "parent Pi interrupted the active turn");
+					writeLog(agent, "steer", `interrupt requested: ${message}`);
+					setActivity(agent, "working", "cancelling for correction");
+					agent.client.cancel();
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Interrupt sent to Cursor ACP subagent "${agent.name}" [${agent.id}]. The corrective prompt will start as soon as Cursor acknowledges cancellation.`,
+							},
+						],
+						details: {
+							action: "steer",
+							status: "cancelling",
+							id: agent.id,
+							name: agent.name,
+							turn: agent.turn,
+						},
+					};
+				}
+
 				case "list": {
 					const agents = Array.from(runtime.agents.values());
 					const text = agents.length === 0
 						? "No managed Cursor ACP subagents."
 						: agents
 							.map(
-								(agent) =>
-									`- ${agent.name} [${agent.id}] — ${agent.model}, permissions=${agent.permissionMode}, ${agent.status}, ${agent.activity}, turn ${agent.turn}, ${formatElapsed(agent.createdAt)}`,
+								(agent) => {
+									const approvals = Array.from(approvalMap(agent).keys());
+									return `- ${agent.name} [${agent.id}] — ${agent.model}, permissions=${agent.permissionMode}, check-in=${agent.checkInMinutes === 0 ? "off" : `${agent.checkInMinutes}m`}, ${agent.status}, ${agent.activity}, turn ${agent.turn}, ${formatElapsed(agent.createdAt)}${approvals.length > 0 ? `, pending approvals: ${approvals.join(", ")}` : ""}`;
+								},
 							)
 							.join("\n");
 					return {
@@ -1074,6 +1336,7 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 								name: agent.name,
 								model: agent.model,
 								permissionMode: agent.permissionMode,
+								checkInMinutes: agent.checkInMinutes,
 								status: agent.status,
 								activity: agent.activity,
 								turn: agent.turn,
@@ -1081,6 +1344,10 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 								viewerPaneId: agent.viewerPaneId,
 								viewerTabId: agent.viewerTabId,
 								logPath: agent.logPath,
+								pendingApprovals: Array.from(approvalMap(agent).values()).map((approval) => ({
+									approvalId: approval.id,
+									summary: approval.summary,
+								})),
 							})),
 						},
 					};
@@ -1113,6 +1380,30 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 					return {
 						content: [{ type: "text", text: `Stopped Cursor ACP subagent "${agent.name}" [${agent.id}].` }],
 						details: { action: "stop", status: "stopped", id: agent.id, name: agent.name },
+					};
+				}
+
+				case "approve":
+				case "reject": {
+					const agent = resolveTarget(params.target);
+					const decision = params.action;
+					const pending = resolvePendingApproval(agent, params.approvalId, decision);
+					return {
+						content: [
+							{
+								type: "text",
+								text: decision === "approve"
+									? `Approved once for Cursor ACP subagent "${agent.name}" [${agent.id}].`
+									: `Rejected permission for Cursor ACP subagent "${agent.name}" [${agent.id}].`,
+							},
+						],
+						details: {
+							action: decision,
+							status: decision === "approve" ? "approved-once" : "rejected",
+							id: agent.id,
+							name: agent.name,
+							approvalId: pending.id,
+						},
 					};
 				}
 			}
@@ -1171,6 +1462,20 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 	});
 
 	pi.registerMessageRenderer("cursor_subagent_status", (message, _options, theme) => {
+		const content = typeof message.content === "string" ? message.content : String(message.content ?? "");
+		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+		box.addChild(new Text(theme.fg("warning", content), 0, 0));
+		return box;
+	});
+
+	pi.registerMessageRenderer("cursor_subagent_approval", (message, _options, theme) => {
+		const content = typeof message.content === "string" ? message.content : String(message.content ?? "");
+		const box = new Box(1, 1, (text) => theme.bg("toolPendingBg", text));
+		box.addChild(new Text(theme.fg("warning", content), 0, 0));
+		return box;
+	});
+
+	pi.registerMessageRenderer("cursor_subagent_checkin", (message, _options, theme) => {
 		const content = typeof message.content === "string" ? message.content : String(message.content ?? "");
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		box.addChild(new Text(theme.fg("warning", content), 0, 0));

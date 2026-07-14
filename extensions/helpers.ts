@@ -1,8 +1,8 @@
 /** Permission and config helpers kept pure for unit testing. */
 
-export type PermissionMode = "prompt" | "allow-once" | "deny";
+export type PermissionMode = "prompt" | "agent" | "allow-once" | "deny";
 
-export const PERMISSION_MODES = ["prompt", "allow-once", "deny"] as const;
+export const PERMISSION_MODES = ["prompt", "agent", "allow-once", "deny"] as const;
 
 export const ALLOW_ONCE_IDS = ["allow-once", "allow_once"] as const;
 export const ALLOW_ALWAYS_IDS = ["allow-always", "allow_always"] as const;
@@ -82,8 +82,8 @@ function optionIdOf(value: unknown): string | undefined {
 }
 
 export function normalizePermissionMode(value: unknown): PermissionMode {
-	if (value === "allow-once" || value === "deny" || value === "prompt") return value;
-	return "prompt";
+	if (value === "agent" || value === "allow-once" || value === "deny" || value === "prompt") return value;
+	return "agent";
 }
 
 export function normalizePermissionOptions(params: unknown): PermissionOption[] {
@@ -144,6 +144,10 @@ export function selectedPermissionResult(optionId: string): PermissionResult {
 	return { outcome: { outcome: "selected", optionId } };
 }
 
+export function cancelledPermissionResult(): PermissionResult {
+	return { outcome: { outcome: "cancelled" } };
+}
+
 /** Prefer reject-once when offered; otherwise cancel. Never invent allow_* outcomes. */
 export function rejectPermissionResult(options: PermissionOption[]): PermissionResult {
 	const rejectId = findPermissionOptionId(options, REJECT_ONCE_IDS);
@@ -156,7 +160,7 @@ export function rejectPermissionResult(options: PermissionOption[]): PermissionR
  * `allow-once` mode never auto-selects allow-always.
  */
 export function resolveAutomaticPermission(
-	mode: Exclude<PermissionMode, "prompt">,
+	mode: "allow-once" | "deny",
 	options: PermissionOption[],
 ): PermissionResult {
 	if (mode === "allow-once") {
@@ -165,6 +169,19 @@ export function resolveAutomaticPermission(
 		return rejectPermissionResult(options);
 	}
 	return rejectPermissionResult(options);
+}
+
+/** Resolve a decision made by the parent Pi agent without ever granting persistent access. */
+export function resolveAgentPermissionDecision(
+	decision: "approve" | "reject",
+	options: PermissionOption[],
+): PermissionResult {
+	if (decision === "reject") return rejectPermissionResult(options);
+	const allowOnce = findPermissionOptionId(options, ALLOW_ONCE_IDS);
+	if (!allowOnce) {
+		throw new Error("Cursor did not offer an allow-once option for this approval request.");
+	}
+	return selectedPermissionResult(allowOnce);
 }
 
 export function resolvePromptPermissionSelection(

@@ -14,6 +14,10 @@ const config = new Map([
 
 let sessionId = "sess_test_1";
 let closed = false;
+/** @type {Map<string, (message: any) => void>} */
+const serverRequestResponses = new Map();
+/** @type {undefined | (() => void)} */
+let cancelActivePrompt;
 
 /**
  * @param {Record<string, unknown>} message
@@ -67,6 +71,26 @@ async function handle(message) {
 			return;
 		}
 		case "session/prompt": {
+			const promptText = params.prompt?.[0]?.text;
+			if (promptText === "wait-for-cancel") {
+				write({
+					jsonrpc: "2.0",
+					method: "session/update",
+					params: {
+						sessionId,
+						update: {
+							sessionUpdate: "agent_thought_chunk",
+							content: { type: "text", text: "waiting for cancellation" },
+						},
+					},
+				});
+				await new Promise((resolve) => {
+					cancelActivePrompt = resolve;
+				});
+				cancelActivePrompt = undefined;
+				write({ jsonrpc: "2.0", id, result: { stopReason: "cancelled" } });
+				return;
+			}
 			write({
 				jsonrpc: "2.0",
 				method: "session/update",
@@ -94,14 +118,23 @@ async function handle(message) {
 				jsonrpc: "2.0",
 				id: permissionId,
 				method: "session/request_permission",
-				params: { sessionId, toolCall: { title: "read" } },
+				params: {
+					sessionId,
+					toolCall: { title: "Read package.json", kind: "read" },
+					options: [
+						{ optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+						{ optionId: "allow-always", name: "Allow always", kind: "allow_always" },
+						{ optionId: "reject-once", name: "Reject once", kind: "reject_once" },
+					],
+				},
 			});
-			// Wait briefly for the client response; ignore body for the mock.
-			await new Promise((resolve) => setTimeout(resolve, 20));
+			const permissionResponse = await new Promise((resolve) => {
+				serverRequestResponses.set(permissionId, resolve);
+			});
 			write({
 				jsonrpc: "2.0",
 				id,
-				result: { stopReason: "end_turn" },
+				result: { stopReason: "end_turn", permissionOutcome: permissionResponse.result?.outcome },
 			});
 			return;
 		}
@@ -125,11 +158,13 @@ rl.on("line", (line) => {
 		return;
 	}
 	if (message.method === "session/cancel") {
-		closed = true;
+		cancelActivePrompt?.();
 		return;
 	}
-	if (message.id !== undefined && message.result !== undefined) {
-		// Client response to a server request; ignore.
+	if (message.id !== undefined && !message.method && (message.result !== undefined || message.error !== undefined)) {
+		const resolve = serverRequestResponses.get(message.id);
+		serverRequestResponses.delete(message.id);
+		resolve?.(message);
 		return;
 	}
 	void handle(message);
