@@ -1,5 +1,5 @@
 {
-	"name": "pi-cursor-herdr-subagents",
+	"name": "pi-bstn-subagents",
 	"version": "0.1.1",
 	"description": "Manage interactive Cursor ACP subagents from Pi, with each session visualized in a Herdr event-viewer tab.",
 	"type": "module",
@@ -14,13 +14,13 @@
 		"herdr",
 		"subagent"
 	],
-	"homepage": "https://github.com/bstncartwright/pi-cursor-herdr-subagents#readme",
+	"homepage": "https://github.com/bstncartwright/pi-bstn-subagents#readme",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/bstncartwright/pi-cursor-herdr-subagents.git"
+		"url": "git+https://github.com/bstncartwright/pi-bstn-subagents.git"
 	},
 	"bugs": {
-		"url": "https://github.com/bstncartwright/pi-cursor-herdr-subagents/issues"
+		"url": "https://github.com/bstncartwright/pi-bstn-subagents/issues"
 	},
 	"files": [
 		"extensions",

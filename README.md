@@ -1,4 +1,4 @@
-# pi-cursor-herdr-subagents
+# pi-bstn-subagents
 
 A [Pi](https://pi.dev) package that manages interactive [Cursor](https://cursor.com) agents over ACP, with each subagent visualized in a dedicated background [Herdr](https://herdr.dev) event-viewer tab.
 
@@ -16,27 +16,27 @@ Spawn and follow-up return immediately after submission. Structured ACP thoughts
 Pinned v0.1.1 from Git:
 
 ```bash
-pi install git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.1
+pi install git:github.com/bstncartwright/pi-bstn-subagents@v0.1.1
 ```
 
 Project-local:
 
 ```bash
-pi install -l git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.1
+pi install -l git:github.com/bstncartwright/pi-bstn-subagents@v0.1.1
 ```
 
 Try for one run without installing:
 
 ```bash
-pi -e git:github.com/bstncartwright/pi-cursor-herdr-subagents@v0.1.1
+pi -e git:github.com/bstncartwright/pi-bstn-subagents@v0.1.1
 ```
 
 From a local checkout:
 
 ```bash
-pi install /absolute/path/to/pi-cursor-herdr-subagents
+pi install /absolute/path/to/pi-bstn-subagents
 # or
-pi -e /absolute/path/to/pi-cursor-herdr-subagents
+pi -e /absolute/path/to/pi-bstn-subagents
 ```
 
 If Pi is already running, reload with `/reload`.
@@ -44,6 +44,8 @@ If Pi is already running, reload with `/reload`.
 ### Migration from the old local extension
 
 If you previously used the auto-discovered copy at `~/.pi/agent/extensions/cursor-herdr-subagents/`, **remove that directory** (or move it aside) before relying on this package. Otherwise Pi can load both the old auto-allowing extension and this package, and behavior will be confusing or unsafe. After removal, install the package above and `/reload`.
+
+If you installed this package under its former name, `pi-cursor-herdr-subagents`, uninstall or remove that package entry before installing `pi-bstn-subagents`. Pi treats them as separate packages and can otherwise register the `subagent` tool twice. Existing event logs remain in `~/.pi/agent/pi-cursor-herdr-subagents/`; the renamed package writes new logs under `~/.pi/agent/pi-bstn-subagents/`.
 
 When upgrading from `v0.1.0`, stop existing subagents and restart Pi once. The old runtime registered those viewer panes as Herdr agents; a full restart clears that legacy state before `v0.1.1` creates viewer-only tabs.
 
@@ -102,7 +104,7 @@ After handling a completed result, the parent Pi agent should call `stop` if it 
 Event logs are stored under Pi’s agent directory with private modes (`0700` dirs / `0600` logs):
 
 ```text
-~/.pi/agent/pi-cursor-herdr-subagents/<id>/events.log
+~/.pi/agent/pi-bstn-subagents/<id>/events.log
 ```
 
 Logs intentionally omit raw tool inputs and redact permission payloads to title/kind. They can still contain prompts, streamed thoughts/assistant text, and paths you should treat as sensitive.
@@ -130,7 +132,7 @@ Only install from sources you trust. Review the extension code before enabling i
 | `herdr CLI is unavailable` | Ensure `herdr` is on `PATH` (`herdr --version`) |
 | `Cursor agent CLI is unavailable` | Ensure `agent` is on `PATH` (`agent --version`) and you are logged in |
 | Permissions always rejected | Need Pi UI (`hasUI`) for human `prompt`, use `permissionMode=agent` for parent-agent decisions, or pass `permissionMode=allow-once` intentionally |
-| Duplicate / unexpected subagent tool | Remove `~/.pi/agent/extensions/cursor-herdr-subagents/` and reload |
+| Duplicate / unexpected subagent tool | Remove the old local extension or former `pi-cursor-herdr-subagents` package entry, then reload |
 | Grok High config rejected / Fast forced | This package requests Cursor’s `parameterizedModelPicker` capability and asserts `fast=false`; update Cursor CLI if options are missing |
 | Viewer tab empty | Check the event log path returned by `spawn` / `list`; Herdr runs `tail -F` on that file |
 | Parent never receives a result | Confirm the session was not stopped early; use `subagent action=read` or inspect the event log |

@@ -16,7 +16,7 @@ const pkg = require("../package.json") as {
 };
 
 test("package.json declares a git-installable pi package", () => {
-	assert.equal(pkg.name, "pi-cursor-herdr-subagents");
+	assert.equal(pkg.name, "pi-bstn-subagents");
 	assert.equal(pkg.license, "MIT");
 	assert.equal(pkg.type, "module");
 	assert.ok(pkg.keywords.includes("pi-package"));

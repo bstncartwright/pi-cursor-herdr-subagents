@@ -15,7 +15,7 @@ import {
 const mockAgent = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "mock-cursor-acp.mjs");
 
 test("package metadata is coherent for ACP clientInfo", () => {
-	assert.equal(PACKAGE_NAME, "pi-cursor-herdr-subagents");
+	assert.equal(PACKAGE_NAME, "pi-bstn-subagents");
 	assert.match(PACKAGE_VERSION, /^\d+\.\d+\.\d+$/);
 });
 
