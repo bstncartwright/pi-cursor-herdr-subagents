@@ -177,7 +177,7 @@ The explicit `backend` passed to `spawn_agent` must agree with the template. Pi 
 
 Every live backend gets a background Herdr event-viewer tab. These tabs are viewers only and are not registered as Herdr agents.
 
-- `/agents` browses current-session agents; press Tab for read-only history. Each agent has a live activity subline with task fallback.
+- `/agents` browses current-session agents; press Tab for read-only history. Each agent has a live activity subline that switches to a compact final-response summary after settlement.
 - `/subagent <task-name>` opens one current-session agent.
 - The persistent editor widget uses the same two-line format with phases such as `Thinking`, `Writing response`, `Tool · bash`, and `Awaiting approval`.
 - In the overlay: Left/Right changes agents, `j`/`k` scrolls, `g`/`G` jumps, and `q` closes.

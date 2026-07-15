@@ -120,7 +120,11 @@ test("activity summaries prefer sanitized live phases and fall back to the task"
 		"Tool · bash",
 	);
 	assert.equal(
-		agentActivitySummary({ status: "completed", lastTaskMessage: "Review\nactivity UI" }, "Writing response"),
+		agentActivitySummary({ status: "completed", lastTaskMessage: "Review\nactivity UI", finalResponse: "Found\nthree issues" }, "Writing response"),
+		"Result · Found three issues",
+	);
+	assert.equal(
+		agentActivitySummary({ status: "failed", lastTaskMessage: "Review activity UI" }),
 		"Task · Review activity UI",
 	);
 	assert.equal(agentActivitySummary({ status: "running" }), "Working");

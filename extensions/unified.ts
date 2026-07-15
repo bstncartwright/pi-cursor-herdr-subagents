@@ -136,13 +136,15 @@ export function compactActivityText(value: string | undefined, maxCodePoints = 1
 }
 
 export function agentActivitySummary(
-	info: Pick<AgentInfo, "status" | "lastTaskMessage">,
+	info: Pick<AgentInfo, "status" | "lastTaskMessage" | "finalResponse">,
 	currentActivity?: string,
 ): string {
 	const current = compactActivityText(currentActivity);
 	if ((info.status === "starting" || info.status === "running") && current) return current;
+	const result = compactActivityText(info.finalResponse);
+	if (result) return `Result · ${result}`;
 	const task = compactActivityText(info.lastTaskMessage);
-	return task ? `Task · ${task}` : info.status === "starting" || info.status === "running" ? "Working" : "No task summary";
+	return task ? `Task · ${task}` : info.status === "starting" || info.status === "running" ? "Working" : "No result summary";
 }
 
 interface Config {
