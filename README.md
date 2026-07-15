@@ -82,6 +82,8 @@ There is deliberately no default backend. Callers must choose `pi` or `cursor` e
 
 Wait tools have no model-facing timeout and honor cancellation of their tool call. Never tell the parent model to sleep or poll. If no active wait consumes a completion, the extension automatically delivers the result as a Pi `followUp` message and triggers a parent turn. An active wait receives the event directly instead, avoiding duplicate delivery. Cursor permission requests use the same rule.
 
+Completed, failed, or interrupted subagents remain available for follow-up work for 15 minutes. Starting another turn resets that window; after 15 idle minutes the backend process and Herdr viewer close automatically while persisted result history remains available.
+
 ### Cursor permissions
 
 `permission_mode` applies only to Cursor:
@@ -175,8 +177,9 @@ The explicit `backend` passed to `spawn_agent` must agree with the template. Pi 
 
 Every live backend gets a background Herdr event-viewer tab. These tabs are viewers only and are not registered as Herdr agents.
 
-- `/agents` browses current-session agents; press Tab for read-only history.
+- `/agents` browses current-session agents; press Tab for read-only history. Each agent has a live activity subline with task fallback.
 - `/subagent <task-name>` opens one current-session agent.
+- The persistent editor widget uses the same two-line format with phases such as `Thinking`, `Writing response`, `Tool · bash`, and `Awaiting approval`.
 - In the overlay: Left/Right changes agents, `j`/`k` scrolls, `g`/`G` jumps, and `q` closes.
 
 The parent Herdr pane remains `working` while either backend has an outstanding turn.

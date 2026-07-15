@@ -59,6 +59,7 @@ const MAX_AGENTS = 8;
 const DEFAULT_PI_TOOLS = "read,bash,grep,find,ls";
 const REQUEST_TIMEOUT_MS = 15_000;
 const PERMISSION_TIMEOUT_MS = 120_000;
+export const SUBAGENT_IDLE_CLOSE_MS = 15 * 60 * 1000;
 const PARENT_SOURCE = `${PACKAGE_NAME}:unified-parent`;
 const FINAL = new Set<AgentStatus>(["completed", "failed", "interrupted", "closed"]);
 
@@ -123,6 +124,27 @@ export interface AgentInfo {
 	error?: string;
 }
 
+export function compactActivityText(value: string | undefined, maxCodePoints = 120): string {
+	if (!value) return "";
+	const clean = value
+		.replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
+		.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	const points = Array.from(clean);
+	return points.length > maxCodePoints ? `${points.slice(0, Math.max(0, maxCodePoints - 1)).join("")}…` : clean;
+}
+
+export function agentActivitySummary(
+	info: Pick<AgentInfo, "status" | "lastTaskMessage">,
+	currentActivity?: string,
+): string {
+	const current = compactActivityText(currentActivity);
+	if ((info.status === "starting" || info.status === "running") && current) return current;
+	const task = compactActivityText(info.lastTaskMessage);
+	return task ? `Task · ${task}` : info.status === "starting" || info.status === "running" ? "Working" : "No task summary";
+}
+
 interface Config {
 	storageDir?: string;
 	defaults?: {
@@ -156,6 +178,9 @@ interface RuntimeHandle {
 	currentOutput: string;
 	candidateError?: string;
 	queuedCursorMessage?: string;
+	phase: string;
+	activeTools: Map<string, string>;
+	promptPermissionPending: boolean;
 	pendingApprovals: Map<string, PendingApproval>;
 }
 
@@ -607,7 +632,10 @@ class PiRpcClient {
 			if (delta?.type === "text_delta") this.onEvent({ type: "text", text: delta.delta ?? "" });
 			if (delta?.type === "thinking_delta") this.onEvent({ type: "thought", text: delta.delta ?? "" });
 		}
-		if (event.type === "tool_execution_start") this.onEvent({ type: "tool", name: event.toolName ?? "tool" });
+		if (event.type === "tool_execution_start") this.onEvent({ type: "tool_start", id: event.toolCallId ?? event.toolName ?? "tool", name: event.toolName ?? "tool" });
+		if (event.type === "tool_execution_end") this.onEvent({ type: "tool_end", id: event.toolCallId ?? event.toolName ?? "tool" });
+		if (event.type === "auto_retry_start") this.onEvent({ type: "phase", phase: "Retrying" });
+		if (event.type === "auto_compaction_start" || event.type === "compaction_start") this.onEvent({ type: "phase", phase: "Compacting" });
 		if (event.type === "message_end" && event.message?.role === "assistant") {
 			this.candidateResponse = messageText(event.message).trim();
 			this.candidateError = ["error", "aborted"].includes(event.message.stopReason)
@@ -645,6 +673,7 @@ class UnifiedManager {
 	private readonly mailbox: MailEvent[] = [];
 	private waiters: Waiter[] = [];
 	private readonly waitAllScopes = new Set<WaitAllScope>();
+	private readonly idleCloseTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; completedAt: number }>();
 	private readonly defaultWaitTargets = new Map<string, Set<string>>();
 	private ctx?: ExtensionContext;
 	private parentSeq = Date.now() * 1000;
@@ -817,11 +846,14 @@ class UnifiedManager {
 			saveInfo(info);
 			if (info.backend === "pi") {
 				await live.pi!.steer(message);
+				this.setPhase(live, "Applying parent correction");
 				log(info, "steer", message);
 				return { delivery: "steer" };
 			}
 			if (live.queuedCursorMessage) throw new Error(`Cursor agent ${info.canonicalName} already has a corrective message queued.`);
 			live.queuedCursorMessage = message;
+			live.activeTools.clear();
+			this.setPhase(live, "Applying parent correction");
 			this.rejectApprovals(live, true, "active Cursor turn interrupted");
 			live.cursor!.cancel();
 			log(info, "steer", `cancel-and-prompt: ${message}`);
@@ -842,15 +874,22 @@ class UnifiedManager {
 		if (live) {
 			live.generation++;
 			live.pending = false;
+			live.activeTools.clear();
+			live.promptPermissionPending = false;
 			this.rejectApprovals(live, true, "agent interrupted");
-			if (live.kind === "pi") await live.pi!.abort();
-			else live.cursor!.cancel();
+			try {
+				if (live.kind === "pi") await live.pi!.abort();
+				else live.cursor!.cancel();
+			} catch (error) {
+				log(info, "interrupt", `backend cancellation failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
 		}
 		info.status = "interrupted";
 		info.completedAt = Date.now();
 		info.lastActivity = Date.now();
 		saveInfo(info);
 		this.pushMail(this.completionEvent(info), false);
+		this.scheduleIdleClose(info);
 		this.refresh();
 		return previous;
 	}
@@ -880,6 +919,7 @@ class UnifiedManager {
 		live.pendingApprovals.delete(approvalId);
 		pending.resolve(result);
 		log(info, "permission", `${approvalId} ${decision === "approve" ? "approved once" : "rejected"}`);
+		this.updateWidget();
 	}
 
 	readResponse(parentSessionId: string, target: string): { info: AgentInfo; response: string } {
@@ -950,6 +990,12 @@ class UnifiedManager {
 		if (this.widgetTimer) clearInterval(this.widgetTimer);
 		this.widgetTimer = undefined;
 		this.ctx?.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined);
+		let ownedInfos: AgentInfo[] = [];
+		if (this.ctx) {
+			try { ownedInfos = readScope(this.parentSessionId(this.ctx)); } catch {}
+		}
+		for (const record of this.idleCloseTimers.values()) clearTimeout(record.timer);
+		this.idleCloseTimers.clear();
 		const lives = [...this.live.values()];
 		for (const live of lives) {
 			if (live.info.status === "starting" || live.info.status === "running") {
@@ -960,7 +1006,8 @@ class UnifiedManager {
 			}
 		}
 		await Promise.allSettled(lives.map((live) => this.closeLive(live.info.id, true)));
-		await Promise.allSettled(lives.map((live) => this.closeViewer(live.info)));
+		const viewerInfos = new Map([...ownedInfos, ...lives.map((live) => live.info)].map((info) => [info.id, info]));
+		await Promise.allSettled([...viewerInfos.values()].map((info) => this.closeViewer(info)));
 		this.waiters = [];
 		this.ctx = undefined;
 		this.parentWorking = true;
@@ -1037,6 +1084,9 @@ class UnifiedManager {
 			closing: false,
 			generation: 0,
 			currentOutput: "",
+			phase: "Starting",
+			activeTools: new Map(),
+			promptPermissionPending: false,
 			pendingApprovals: new Map(),
 		};
 		this.live.set(info.id, live);
@@ -1096,12 +1146,17 @@ class UnifiedManager {
 	}
 
 	private async beginPrompt(info: AgentInfo, prompt: string, displayMessage: string): Promise<void> {
+		this.clearIdleClose(info.id);
+		this.clearCompletionMail(info);
 		const live = this.live.get(info.id) ?? await this.startRuntime(info);
 		if (live.pending) throw new Error(`Agent ${info.canonicalName} is already running.`);
 		live.pending = true;
 		live.generation++;
 		live.currentOutput = "";
 		live.candidateError = undefined;
+		live.phase = "Thinking";
+		live.activeTools.clear();
+		live.promptPermissionPending = false;
 		const generation = live.generation;
 		info.status = "running";
 		info.turn++;
@@ -1146,11 +1201,21 @@ class UnifiedManager {
 		if (live.closing) return;
 		if (event.type === "text") {
 			live.currentOutput += event.text;
+			this.setPhase(live, "Writing response");
 			log(live.info, "assistant", event.text);
 		} else if (event.type === "thought") {
+			this.setPhase(live, "Thinking");
 			log(live.info, "thought", event.text);
-		} else if (event.type === "tool") {
+		} else if (event.type === "tool_start") {
+			this.mutateActivity(live, () => live.activeTools.set(String(event.id), compactActivityText(String(event.name), 80) || "tool"));
 			log(live.info, "tool", event.name);
+		} else if (event.type === "tool_end") {
+			this.mutateActivity(live, () => {
+				live.activeTools.delete(String(event.id));
+				if (live.activeTools.size === 0) live.phase = "Thinking";
+			});
+		} else if (event.type === "phase") {
+			this.setPhase(live, event.phase);
 		} else if (event.type === "settled" && live.pending) {
 			this.finalize(live, event.error ? "failed" : "completed", event.output ?? live.currentOutput, event.error);
 		}
@@ -1165,11 +1230,22 @@ class UnifiedManager {
 			if (kind === "agent_message_chunk") {
 				const text = contentText(update.content);
 				live.currentOutput += text;
+				this.setPhase(live, "Writing response");
 				log(live.info, "assistant", text);
 			} else if (kind === "agent_thought_chunk") {
+				this.setPhase(live, "Thinking");
 				log(live.info, "thought", contentText(update.content));
 			} else if (kind === "tool_call" || kind === "tool_call_update") {
-				log(live.info, "tool", update.title ?? update.toolCall?.title ?? update.toolCall?.name ?? "tool");
+				const id = String(update.toolCallId ?? update.toolCall?.toolCallId ?? update.toolCall?.id ?? update.title ?? "tool");
+				const title = compactActivityText(update.title ?? update.toolCall?.title ?? update.toolCall?.name ?? "tool", 80) || "tool";
+				const status = String(update.status ?? update.toolCall?.status ?? "").toLowerCase();
+				this.mutateActivity(live, () => {
+					if (["completed", "failed", "cancelled", "canceled"].includes(status)) {
+						live.activeTools.delete(id);
+						if (live.activeTools.size === 0) live.phase = "Thinking";
+					} else live.activeTools.set(id, title);
+				});
+				log(live.info, "tool", title);
 			} else if (kind) log(live.info, kind, JSON.stringify(update).slice(0, 2000));
 		} else if (message.method === "cursor/update_todos") {
 			log(live.info, "todos", JSON.stringify(message.params?.todos ?? []).slice(0, 2000));
@@ -1196,10 +1272,17 @@ class UnifiedManager {
 		if (mode === "prompt") {
 			const ctx = this.ctx;
 			if (!ctx?.hasUI) return rejectPermissionResult(options);
-			const labels = options.map((option) => option.name ?? option.optionId);
-			const selected = await ctx.ui.select(`Cursor ${live.info.canonicalName} — ${summary}`, labels, { timeout: PERMISSION_TIMEOUT_MS });
-			const option = options[labels.indexOf(selected ?? "")];
-			return option ? { outcome: { outcome: "selected", optionId: option.optionId } } : rejectPermissionResult(options);
+			live.promptPermissionPending = true;
+			this.updateWidget();
+			try {
+				const labels = options.map((option) => option.name ?? option.optionId);
+				const selected = await ctx.ui.select(`Cursor ${live.info.canonicalName} — ${summary}`, labels, { timeout: PERMISSION_TIMEOUT_MS });
+				const option = options[labels.indexOf(selected ?? "")];
+				return option ? { outcome: { outcome: "selected", optionId: option.optionId } } : rejectPermissionResult(options);
+			} finally {
+				live.promptPermissionPending = false;
+				this.updateWidget();
+			}
 		}
 		const approvalId = randomUUID().slice(0, 8);
 		const allowOnceOffered = !!findPermissionOptionId(options, ALLOW_ONCE_IDS);
@@ -1208,9 +1291,11 @@ class UnifiedManager {
 				live.pendingApprovals.delete(approvalId);
 				resolvePermission(rejectPermissionResult(options));
 				log(live.info, "permission", `${approvalId} timed out and was rejected`);
+				this.updateWidget();
 			}, PERMISSION_TIMEOUT_MS);
 			timer.unref?.();
 			live.pendingApprovals.set(approvalId, { id: approvalId, summary, options, resolve: resolvePermission, timer });
+			this.updateWidget();
 			this.pushMail({
 				id: randomUUID(),
 				parentSessionId: live.info.parentSessionId,
@@ -1228,6 +1313,8 @@ class UnifiedManager {
 	private finalize(live: RuntimeHandle, status: "completed" | "failed", output: string, error?: string): void {
 		if (live.closing || !live.pending) return;
 		live.pending = false;
+		live.activeTools.clear();
+		live.promptPermissionPending = false;
 		live.info.status = status;
 		live.info.finalResponse = output.trim();
 		live.info.error = error;
@@ -1237,6 +1324,7 @@ class UnifiedManager {
 		log(live.info, "turn", error ? `failed: ${error}` : "completed");
 		saveInfo(live.info);
 		this.pushMail(this.completionEvent(live.info));
+		this.scheduleIdleClose(live.info);
 		this.refresh();
 	}
 
@@ -1302,12 +1390,15 @@ class UnifiedManager {
 	}
 
 	private rejectApprovals(live: RuntimeHandle, cancelled: boolean, reason: string): void {
+		const hadApprovals = live.pendingApprovals.size > 0 || live.promptPermissionPending;
 		for (const approval of live.pendingApprovals.values()) {
 			clearTimeout(approval.timer);
 			approval.resolve(cancelled ? cancelledPermissionResult() : rejectPermissionResult(approval.options));
 			log(live.info, "permission", `${approval.id} ${cancelled ? "cancelled" : "rejected"}: ${reason}`);
 		}
 		live.pendingApprovals.clear();
+		live.promptPermissionPending = false;
+		if (hadApprovals) this.updateWidget();
 	}
 
 	private handleRuntimeExit(live: RuntimeHandle, error?: Error): void {
@@ -1322,11 +1413,55 @@ class UnifiedManager {
 			live.info.lastActivity = Date.now();
 			saveInfo(live.info);
 			this.pushMail(this.completionEvent(live.info));
+			this.scheduleIdleClose(live.info);
 		}
 		this.refresh();
 	}
 
+	private clearCompletionMail(info: AgentInfo): void {
+		for (let index = this.mailbox.length - 1; index >= 0; index--) {
+			const event = this.mailbox[index]!;
+			if (event.kind === "completion" && event.parentSessionId === info.parentSessionId && event.agentName === info.canonicalName) {
+				this.mailbox.splice(index, 1);
+			}
+		}
+	}
+
+	private clearIdleClose(id: string): void {
+		const record = this.idleCloseTimers.get(id);
+		if (!record) return;
+		clearTimeout(record.timer);
+		this.idleCloseTimers.delete(id);
+	}
+
+	private scheduleIdleClose(info: AgentInfo): void {
+		if (!info.completedAt || info.status === "closed") return;
+		this.clearIdleClose(info.id);
+		const completedAt = info.completedAt;
+		const timer = setTimeout(() => void this.autoCloseIdle(info.infoFile, info.id, completedAt), SUBAGENT_IDLE_CLOSE_MS);
+		timer.unref?.();
+		this.idleCloseTimers.set(info.id, { timer, completedAt });
+	}
+
+	private async autoCloseIdle(infoFile: string, id: string, completedAt: number): Promise<void> {
+		const record = this.idleCloseTimers.get(id);
+		if (!record || record.completedAt !== completedAt) return;
+		this.idleCloseTimers.delete(id);
+		const info = readJson<AgentInfo>(infoFile);
+		if (!info || info.completedAt !== completedAt || !FINAL.has(info.status) || info.status === "closed") return;
+		// Persist the claim before awaiting resource cleanup so follow-up work cannot race the close.
+		info.status = "closed";
+		info.closedAt = Date.now();
+		info.lastActivity = Date.now();
+		saveInfo(info);
+		log(info, "lifecycle", "auto-closed after 15 minutes idle");
+		await this.closeLive(id, true);
+		await this.closeViewer(info).catch(() => undefined);
+		this.refresh();
+	}
+
 	private async closeLive(id: string, remove: boolean): Promise<void> {
+		this.clearIdleClose(id);
 		const live = this.live.get(id);
 		if (!live) return;
 		live.closing = true;
@@ -1334,6 +1469,30 @@ class UnifiedManager {
 		this.rejectApprovals(live, false, "agent closed");
 		await Promise.allSettled([live.pi?.close(), live.cursor?.close()].filter(Boolean) as Promise<void>[]);
 		if (remove) this.live.delete(id);
+	}
+
+	currentActivity(info: AgentInfo): string | undefined {
+		const live = this.live.get(info.id);
+		if (!live?.pending) return undefined;
+		if (live.promptPermissionPending || live.pendingApprovals.size > 0) return "Awaiting approval";
+		const tool = [...live.activeTools.values()].at(-1);
+		if (tool) return `Tool · ${tool}`;
+		return live.phase || "Working";
+	}
+
+	activitySummary(info: AgentInfo): string {
+		return agentActivitySummary(info, this.currentActivity(info));
+	}
+
+	private mutateActivity(live: RuntimeHandle, mutate: () => void): void {
+		const before = this.currentActivity(live.info);
+		mutate();
+		if (before !== this.currentActivity(live.info)) this.updateWidget();
+	}
+
+	private setPhase(live: RuntimeHandle, phase: string): void {
+		if (live.phase === phase) return;
+		this.mutateActivity(live, () => { live.phase = phase; });
 	}
 
 	private refresh(): void {
@@ -1351,6 +1510,7 @@ class UnifiedManager {
 			ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined);
 			return;
 		}
+		const activities = new Map(infos.map((info) => [info.id, this.activitySummary(info)]));
 		ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, (_tui, theme) => ({
 			render(width: number) {
 				const running = infos.filter((info) => info.status === "starting" || info.status === "running").length;
@@ -1358,6 +1518,7 @@ class UnifiedManager {
 				for (const info of infos) {
 					const color = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning";
 					lines.push(`${theme.fg(color, "●")} ${theme.fg("toolTitle", info.canonicalName)} ${theme.fg("dim", `[${info.backend}] ${info.model} · ${info.status}`)}`);
+					lines.push(theme.fg("dim", `  ↳ ${activities.get(info.id) ?? "No task summary"}`));
 				}
 				return lines.map((line) => truncateToWidth(line, width));
 			},
@@ -1491,6 +1652,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 			"After spawn_agent, use wait_agent or wait_all_agents when the delegated result must block the current workflow; never sleep or poll.",
 			"When no active wait consumes a subagent completion, it is delivered automatically as a follow-up message. Use the included result directly and do not wait for that completed turn again.",
 			"Cursor ACP permission requests are returned by an active wait or delivered as follow-up messages; answer them with respond_agent_permission and wait again when needed.",
+			"Settled subagents auto-close after 15 idle minutes. Use send_message before then for follow-up work, or close_agent immediately when reuse is unnecessary.",
 		],
 		parameters: SpawnSchema,
 		async execute(_id: string, params: SpawnParams, _signal: AbortSignal | undefined, _update: unknown, ctx: ExtensionContext) {
@@ -1566,6 +1728,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 				backend: info.backend,
 				agent_status: info.status,
 				model: info.model,
+				current_activity: manager.currentActivity(info) ?? null,
+				activity_summary: manager.activitySummary(info),
 				last_task_message: info.lastTaskMessage ?? null,
 				...(params.include_all ? { parent_session_id: info.parentSessionId } : {}),
 			}));
@@ -1669,32 +1833,55 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 	async function pickAgent(ctx: ExtensionCommandContext): Promise<{ target: string; parent: string; includeAll: boolean } | undefined> {
 		const currentParent = manager.parentSessionId(ctx);
 		return ctx.ui.custom((tui, theme, _keys, done) => {
-			let selected = 0;
+			let selectedId: string | undefined;
 			let includeAll = false;
+			let timer: ReturnType<typeof setInterval> | undefined = setInterval(() => { if (!includeAll) tui.requestRender(); }, 500);
+			timer.unref?.();
+			const finish = (value: { target: string; parent: string; includeAll: boolean } | undefined) => {
+				if (timer) clearInterval(timer);
+				timer = undefined;
+				done(value);
+			};
+			const selection = (infos: AgentInfo[]) => {
+				let index = selectedId ? infos.findIndex((info) => info.id === selectedId) : -1;
+				if (index < 0 && infos.length) {
+					index = 0;
+					selectedId = infos[0]!.id;
+				}
+				return index;
+			};
 			return {
 				render(width: number) {
 					const infos = manager.list(currentParent, includeAll);
-					selected = Math.max(0, Math.min(selected, infos.length - 1));
+					const selected = selection(infos);
+					const maxVisible = Math.max(1, Math.min(8, Math.floor((tui.terminal.rows - 7) / 2)));
+					const start = Math.max(0, Math.min(selected - maxVisible + 1, infos.length - maxVisible));
+					const visible = infos.slice(start, start + maxVisible);
 					const lines = [theme.fg("accent", theme.bold(`Subagents (${includeAll ? "all sessions" : "this session"})`)), ""];
 					if (!infos.length) lines.push(theme.fg("dim", "No agents. Press Tab for historical agents."));
-					for (const [index, info] of infos.slice(0, 12).entries()) {
+					for (const [offset, info] of visible.entries()) {
+						const index = start + offset;
 						const pointer = index === selected ? theme.fg("accent", "› ") : "  ";
 						const statusColor = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning";
 						lines.push(pointer + theme.fg(index === selected ? "accent" : "text", info.canonicalName.padEnd(28)) + theme.fg(statusColor, info.status.padEnd(12)) + theme.fg("dim", `${info.backend} · ${info.model}`));
+						lines.push(theme.fg("dim", `    ↳ ${manager.activitySummary(info)}`));
 					}
-					lines.push("", theme.fg("dim", "enter open · tab this/all · j/k navigate · q close"));
+					const range = infos.length > maxVisible ? ` · ${start + 1}–${Math.min(infos.length, start + maxVisible)} of ${infos.length}` : "";
+					lines.push("", theme.fg("dim", `enter open · tab this/all · j/k navigate · q close${range}`));
 					return lines.map((line) => truncateToWidth(line, width));
 				},
 				handleInput(data: string) {
 					const infos = manager.list(currentParent, includeAll);
-					if (matchesKey(data, "escape") || data === "q") done(undefined);
-					else if (matchesKey(data, "tab")) { includeAll = !includeAll; selected = 0; }
-					else if (matchesKey(data, "down") || data === "j") selected = Math.min(infos.length - 1, selected + 1);
-					else if (matchesKey(data, "up") || data === "k") selected = Math.max(0, selected - 1);
-					else if (matchesKey(data, "return") && infos[selected]) done({ target: infos[selected]!.canonicalName, parent: infos[selected]!.parentSessionId, includeAll });
+					let selected = selection(infos);
+					if (matchesKey(data, "escape") || data === "q") finish(undefined);
+					else if (matchesKey(data, "tab")) { includeAll = !includeAll; selectedId = undefined; }
+					else if ((matchesKey(data, "down") || data === "j") && infos.length) { selected = Math.min(infos.length - 1, selected + 1); selectedId = infos[selected]!.id; }
+					else if ((matchesKey(data, "up") || data === "k") && infos.length) { selected = Math.max(0, selected - 1); selectedId = infos[selected]!.id; }
+					else if (matchesKey(data, "return") && selected >= 0 && infos[selected]) finish({ target: infos[selected]!.canonicalName, parent: infos[selected]!.parentSessionId, includeAll });
 					tui.requestRender();
 				},
 				invalidate() {},
+				dispose() { if (timer) clearInterval(timer); timer = undefined; },
 			};
 		});
 	}

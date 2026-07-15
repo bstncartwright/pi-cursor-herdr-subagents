@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	agentActivitySummary,
+	compactActivityText,
 	JsonlDecoder,
 	normalizeTaskName,
 	parentScopeKey,
 	parseAgentTemplateText,
 	selectInheritedPiTools,
+	SUBAGENT_IDLE_CLOSE_MS,
 	taskStorageKey,
 } from "../extensions/unified.ts";
 
@@ -78,7 +81,6 @@ test("focused tool contract requires an explicit backend and keeps Cursor on ACP
 	assert.doesNotMatch(entrySource, /Legacy Cursor Subagent/);
 });
 
-
 test("Pi tool inheritance excludes parent-only extension tools", () => {
 	const selected = selectInheritedPiTools(
 		["exec_command", "spawn_agent"],
@@ -99,4 +101,27 @@ test("Pi tool inheritance excludes parent-only extension tools", () => {
 		),
 		"read,bash",
 	);
+});
+
+test("settled subagents auto-close after fifteen idle minutes", async () => {
+	assert.equal(SUBAGENT_IDLE_CLOSE_MS, 15 * 60 * 1000);
+	const { readFile } = await import("node:fs/promises");
+	const source = await readFile(new URL("../extensions/unified.ts", import.meta.url), "utf8");
+	assert.match(source, /scheduleIdleClose\(live\.info\)/);
+	assert.match(source, /this\.clearIdleClose\(info\.id\);[\s\S]*this\.clearCompletionMail\(info\)/);
+	assert.match(source, /Persist the claim before awaiting resource cleanup/);
+	assert.match(source, /auto-closed after 15 minutes idle/);
+});
+
+test("activity summaries prefer sanitized live phases and fall back to the task", () => {
+	assert.equal(compactActivityText("\u001b[31mRead\u001b[0m\n  package.json\u202e"), "Read package.json");
+	assert.equal(
+		agentActivitySummary({ status: "running", lastTaskMessage: "Review\nactivity UI" }, "Tool · bash"),
+		"Tool · bash",
+	);
+	assert.equal(
+		agentActivitySummary({ status: "completed", lastTaskMessage: "Review\nactivity UI" }, "Writing response"),
+		"Task · Review activity UI",
+	);
+	assert.equal(agentActivitySummary({ status: "running" }), "Working");
 });
