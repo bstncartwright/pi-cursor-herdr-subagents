@@ -56,6 +56,7 @@ const AGENTS_DIR = join(ROOT, "agents");
 const DEFAULT_RUNS_DIR = join(ROOT, "runs");
 const CURSOR_CONFIG_PATH = join(homedir(), ".cursor", "cli-config.json");
 const MAX_AGENTS = 8;
+const DEFAULT_PI_TOOLS = "read,bash,grep,find,ls";
 const REQUEST_TIMEOUT_MS = 15_000;
 const PERMISSION_TIMEOUT_MS = 120_000;
 const PARENT_SOURCE = `${PACKAGE_NAME}:unified-parent`;
@@ -178,6 +179,11 @@ interface Waiter {
 	resolve: (event: MailEvent) => void;
 }
 
+interface WaitAllScope {
+	parentSessionId: string;
+	targets: Set<string>;
+}
+
 interface SpawnParams {
 	task_name: string;
 	message: string;
@@ -284,6 +290,17 @@ function stringList(value: unknown): string[] | undefined {
 	const raw = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
 	const result = raw.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean);
 	return result.length ? [...new Set(result)] : undefined;
+}
+
+export function selectInheritedPiTools(
+	activeNames: string[],
+	allTools: Array<{ name: string; sourceInfo?: { source?: string } }>,
+): string {
+	const active = new Set(activeNames);
+	const builtins = allTools
+		.filter((tool) => tool.sourceInfo?.source === "builtin" && active.has(tool.name))
+		.map((tool) => tool.name);
+	return builtins.length ? builtins.join(",") : DEFAULT_PI_TOOLS;
 }
 
 function thinkingLevel(value: unknown): ThinkingLevel | undefined {
@@ -627,6 +644,7 @@ class UnifiedManager {
 	private readonly live = new Map<string, RuntimeHandle>();
 	private readonly mailbox: MailEvent[] = [];
 	private waiters: Waiter[] = [];
+	private readonly waitAllScopes = new Set<WaitAllScope>();
 	private readonly defaultWaitTargets = new Map<string, Set<string>>();
 	private ctx?: ExtensionContext;
 	private parentSeq = Date.now() * 1000;
@@ -710,6 +728,14 @@ class UnifiedManager {
 			const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined;
 			const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined;
 			const selectedSkills = params.backend === "pi" ? [...new Set([...(configuredSkills ?? []), ...(params.skills ?? [])])] : [];
+			const inheritedPiTools = selectInheritedPiTools(this.pi.getActiveTools(), this.pi.getAllTools());
+			const selectedTools = params.backend === "pi"
+				? template?.tools !== undefined
+					? template.tools
+					: configuredExtensions?.length
+						? undefined
+						: inheritedPiTools
+				: undefined;
 			const info: AgentInfo = {
 				id,
 				taskName,
@@ -723,7 +749,7 @@ class UnifiedManager {
 				provider,
 				modelId,
 				thinking: template?.thinking ?? (this.pi.getThinkingLevel() as ThinkingLevel),
-				tools: template?.tools ?? (params.backend === "pi" ? this.pi.getActiveTools().join(",") : undefined),
+				tools: selectedTools,
 				skills: selectedSkills,
 				skillPaths: selectedSkills.map((skill) => resolveSkillPath(skill, cwd)),
 				extensions: configuredExtensions,
@@ -824,7 +850,7 @@ class UnifiedManager {
 		info.completedAt = Date.now();
 		info.lastActivity = Date.now();
 		saveInfo(info);
-		this.pushMail(this.completionEvent(info));
+		this.pushMail(this.completionEvent(info), false);
 		this.refresh();
 		return previous;
 	}
@@ -839,7 +865,7 @@ class UnifiedManager {
 		saveInfo(info);
 		await this.closeLive(info.id, true);
 		await this.closeViewer(info).catch(() => undefined);
-		this.pushMail(this.completionEvent(info));
+		this.pushMail(this.completionEvent(info), false);
 		this.refresh();
 		return previous;
 	}
@@ -897,20 +923,26 @@ class UnifiedManager {
 			const missing = [...names].filter((name) => !known.some((info) => info.canonicalName === name));
 			if (missing.length) throw new Error(`Agent not found in this parent session: ${missing.join(", ")}`);
 		}
-		for (;;) {
-			if (signal?.aborted) throw signal.reason;
-			const permissionIndex = this.mailbox.findIndex((event) => event.kind === "permission" && event.parentSessionId === parentSessionId && names.has(event.agentName));
-			if (permissionIndex >= 0) return { event: this.mailbox.splice(permissionIndex, 1)[0]! };
-			const infos = readScope(parentSessionId).filter((info) => names.has(info.canonicalName));
-			if (infos.every((info) => FINAL.has(info.status))) {
-				for (const info of infos) this.defaultWaitTargets.get(parentSessionId)?.delete(info.canonicalName);
-				for (let index = this.mailbox.length - 1; index >= 0; index--) {
-					const event = this.mailbox[index]!;
-					if (event.parentSessionId === parentSessionId && names.has(event.agentName) && event.kind === "completion") this.mailbox.splice(index, 1);
+		const scope: WaitAllScope = { parentSessionId, targets: names };
+		this.waitAllScopes.add(scope);
+		try {
+			for (;;) {
+				if (signal?.aborted) throw signal.reason;
+				const permissionIndex = this.mailbox.findIndex((event) => event.kind === "permission" && event.parentSessionId === parentSessionId && names.has(event.agentName));
+				if (permissionIndex >= 0) return { event: this.mailbox.splice(permissionIndex, 1)[0]! };
+				const infos = readScope(parentSessionId).filter((info) => names.has(info.canonicalName));
+				if (infos.every((info) => FINAL.has(info.status))) {
+					for (const info of infos) this.defaultWaitTargets.get(parentSessionId)?.delete(info.canonicalName);
+					for (let index = this.mailbox.length - 1; index >= 0; index--) {
+						const event = this.mailbox[index]!;
+						if (event.parentSessionId === parentSessionId && names.has(event.agentName) && event.kind === "completion") this.mailbox.splice(index, 1);
+					}
+					return { infos };
 				}
-				return { infos };
+				await delay(250, undefined, signal ? { signal } : undefined);
 			}
-			await delay(250, undefined, signal ? { signal } : undefined);
+		} finally {
+			this.waitAllScopes.delete(scope);
 		}
 	}
 
@@ -1221,18 +1253,52 @@ class UnifiedManager {
 		};
 	}
 
-	private pushMail(event: MailEvent): void {
+	private pushMail(event: MailEvent, notifyParent = true): void {
 		if (event.kind === "completion") {
 			for (let index = this.mailbox.length - 1; index >= 0; index--) {
 				const old = this.mailbox[index]!;
 				if (old.kind === "completion" && old.parentSessionId === event.parentSessionId && old.agentName === event.agentName) this.mailbox.splice(index, 1);
 			}
 		}
-		const index = this.waiters.findIndex((waiter) => waiter.parentSessionId === event.parentSessionId && (!waiter.targets || waiter.targets.has(event.agentName)));
-		if (index >= 0) {
-			const [waiter] = this.waiters.splice(index, 1);
+		const waiterIndex = this.waiters.findIndex((waiter) => waiter.parentSessionId === event.parentSessionId && (!waiter.targets || waiter.targets.has(event.agentName)));
+		if (waiterIndex >= 0) {
+			const [waiter] = this.waiters.splice(waiterIndex, 1);
 			waiter!.resolve(event);
-		} else this.mailbox.push(event);
+			return;
+		}
+		this.mailbox.push(event);
+		const observedByWaitAll = [...this.waitAllScopes].some((scope) =>
+			scope.parentSessionId === event.parentSessionId && scope.targets.has(event.agentName)
+		);
+		if (notifyParent && !observedByWaitAll) this.notifyParent(event);
+	}
+
+	private notifyParent(event: MailEvent): void {
+		if (event.kind === "permission") {
+			this.pi.sendMessage({
+				customType: "bstn_subagent_permission",
+				content: [
+					`Cursor ACP subagent ${event.agentName} requires permission: ${event.summary}.`,
+					`Call respond_agent_permission with target=${JSON.stringify(event.agentName)}, approval_id=${JSON.stringify(event.approvalId)}, and decision=approve or reject. Then call wait_agent again if its result is still needed.`,
+				].join("\n"),
+				display: true,
+				details: { ...event },
+			}, { triggerTurn: true, deliverAs: "followUp" });
+			return;
+		}
+		const info = this.get(event.agentName, event.parentSessionId);
+		const output = boundedResult(event.finalResponse ?? event.error ?? "", info);
+		this.pi.sendMessage({
+			customType: "bstn_subagent_completion",
+			content: [
+				`Subagent ${event.agentName} [${info.backend}] reached ${event.status}.`,
+				"Its result is included below; do not call wait_agent for this completed turn.",
+				"",
+				output.text,
+			].join("\n"),
+			display: true,
+			details: { ...event, backend: info.backend, output: output.text, truncated: output.truncated, fullOutputPath: output.fullOutputPath },
+		}, { triggerTurn: true, deliverAs: "followUp" });
 	}
 
 	private rejectApprovals(live: RuntimeHandle, cancelled: boolean, reason: string): void {
@@ -1422,8 +1488,9 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 		promptSnippet: "Spawn a session-scoped Pi or Cursor ACP agent; backend must be explicit.",
 		promptGuidelines: [
 			"Always pass backend=pi or backend=cursor explicitly to spawn_agent; never infer a hidden default.",
-			"After spawn_agent, use wait_agent or wait_all_agents when the delegated result is needed.",
-			"Cursor ACP permission requests are returned by wait_agent; answer them with respond_agent_permission and wait again.",
+			"After spawn_agent, use wait_agent or wait_all_agents when the delegated result must block the current workflow; never sleep or poll.",
+			"When no active wait consumes a subagent completion, it is delivered automatically as a follow-up message. Use the included result directly and do not wait for that completed turn again.",
+			"Cursor ACP permission requests are returned by an active wait or delivered as follow-up messages; answer them with respond_agent_permission and wait again when needed.",
 		],
 		parameters: SpawnSchema,
 		async execute(_id: string, params: SpawnParams, _signal: AbortSignal | undefined, _update: unknown, ctx: ExtensionContext) {
@@ -1631,6 +1698,20 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 			};
 		});
 	}
+
+	pi.registerMessageRenderer("bstn_subagent_completion", (message, options, theme) => {
+		const details = message.details as { agentName?: string; backend?: string; status?: string; output?: string } | undefined;
+		const output = details?.output ?? String(message.content ?? "");
+		const lines = output.split("\n");
+		const visible = options.expanded ? lines : lines.slice(0, 10);
+		let text = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(details?.agentName ?? "Subagent"))} ${theme.fg("dim", `[${details?.backend ?? "?"}] ${details?.status ?? "completed"}`)}`;
+		if (visible.length) text += `\n${visible.map((line) => theme.fg("customMessageText", line)).join("\n")}`;
+		if (!options.expanded && lines.length > visible.length) text += `\n${theme.fg("muted", `… ${lines.length - visible.length} more lines`)}`;
+		return new Text(text, 0, 0);
+	});
+	pi.registerMessageRenderer("bstn_subagent_permission", (message, _options, theme) =>
+		new Text(theme.fg("warning", String(message.content ?? "Cursor permission required")), 0, 0)
+	);
 
 	pi.registerCommand("agents", {
 		description: "Browse Pi and Cursor ACP subagents.",

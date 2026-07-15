@@ -43,7 +43,6 @@ Run `/reload` after changing the installed package.
 | `close_agent` | Permanently close the process and Herdr viewer |
 | `respond_agent_permission` | Approve once or reject a pending Cursor ACP permission request |
 
-The old `subagent` action tool remains as a deprecated compatibility shim for one release. It keeps its old automatic-delivery behavior; new code should use the focused tools above.
 
 ### Spawn examples
 
@@ -73,15 +72,15 @@ There is deliberately no default backend. Callers must choose `pi` or `cursor` e
 
 ## Workflow
 
-`spawn_agent` returns after the child starts and accepts its task. Results are not injected into the parent automatically:
+`spawn_agent` returns after the child starts and accepts its task:
 
 1. Spawn one or more agents.
 2. Continue independent parent work if useful.
-3. Call `wait_agent` or `wait_all_agents` when results are needed.
+3. Call `wait_agent` or `wait_all_agents` when a result must block the current workflow.
 4. Use `send_message` for follow-up work.
 5. Call `close_agent` when the session is no longer needed.
 
-Wait tools have no model-facing timeout and honor cancellation of their tool call.
+Wait tools have no model-facing timeout and honor cancellation of their tool call. Never tell the parent model to sleep or poll. If no active wait consumes a completion, the extension automatically delivers the result as a Pi `followUp` message and triggers a parent turn. An active wait receives the event directly instead, avoiding duplicate delivery. Cursor permission requests use the same rule.
 
 ### Cursor permissions
 
@@ -196,7 +195,7 @@ This package and every child agent run with your full system permissions. There 
 - Stop old Cursor subagents before reloading.
 - Replace `subagent action=spawn/send/steer/...` with the focused tools.
 - Choose `backend` explicitly for every spawn.
-- Replace automatic result handling with `wait_agent` or `wait_all_agents`.
+- Use `wait_agent` or `wait_all_agents` when the parent must block; otherwise completion arrives automatically as a follow-up.
 - Existing flat event logs remain legacy history and are not imported into parent-session ownership.
 
 If the package was installed under `pi-cursor-herdr-subagents`, remove that package entry to avoid duplicate tools.

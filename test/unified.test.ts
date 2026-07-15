@@ -5,6 +5,7 @@ import {
 	normalizeTaskName,
 	parentScopeKey,
 	parseAgentTemplateText,
+	selectInheritedPiTools,
 	taskStorageKey,
 } from "../extensions/unified.ts";
 
@@ -69,4 +70,33 @@ test("focused tool contract requires an explicit backend and keeps Cursor on ACP
 	const acpSource = await readFile(new URL("../extensions/acp.ts", import.meta.url), "utf8");
 	assert.match(acpSource, /session\/load/);
 	assert.doesNotMatch(source, /sendAsyncMessage\(/);
+	assert.match(source, /deliverAs: "followUp"/);
+	assert.match(source, /observedByWaitAll/);
+	assert.match(source, /registerCommand\("subagent"/);
+	const entrySource = await readFile(new URL("../extensions/index.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(entrySource, /name:\s*"subagent"/);
+	assert.doesNotMatch(entrySource, /Legacy Cursor Subagent/);
+});
+
+
+test("Pi tool inheritance excludes parent-only extension tools", () => {
+	const selected = selectInheritedPiTools(
+		["exec_command", "spawn_agent"],
+		[
+			{ name: "exec_command", sourceInfo: { source: "pi-codex-conversion" } },
+			{ name: "spawn_agent", sourceInfo: { source: "pi-bstn-subagents" } },
+		],
+	);
+	assert.equal(selected, "read,bash,grep,find,ls");
+	assert.equal(
+		selectInheritedPiTools(
+			["read", "bash", "spawn_agent"],
+			[
+				{ name: "read", sourceInfo: { source: "builtin" } },
+				{ name: "bash", sourceInfo: { source: "builtin" } },
+				{ name: "spawn_agent", sourceInfo: { source: "pi-bstn-subagents" } },
+			],
+		),
+		"read,bash",
+	);
 });
