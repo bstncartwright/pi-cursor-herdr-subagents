@@ -1,141 +1,205 @@
 # pi-bstn-subagents
 
-A [Pi](https://pi.dev) package that manages interactive [Cursor](https://cursor.com) agents over ACP, with each subagent visualized in a dedicated background [Herdr](https://herdr.dev) event-viewer tab.
+A [Pi](https://pi.dev) package for session-scoped **Pi** and **Cursor ACP** subagents. Both backends share the same explicit spawn/wait/send/interrupt/close workflow, persisted metadata, Herdr viewers, and Pi overlays. Cursor remains connected exclusively through ACP.
 
-Spawn and follow-up return immediately after submission. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer (via `tail -F` on a private event log). A Pi widget tracks managed sessions, and the parent Pi pane remains `working` in Herdr while any subagent turn is outstanding, including after Pi's own foreground turn has ended. Cursor ACP sessions are **not** registered as Herdr agents and carry no agent badge/`display-agent` metadata — the viewer tab is named only via `tab create --label`. When a turn ends, the result is steered back into Pi. Pi should stop the session when no more follow-up is needed; otherwise it stays open for follow-ups and closes automatically after 15 idle minutes.
+## Requirements
 
-## Prerequisites
-
-- **Pi** with extension/package support (`pi --version`)
-- **[Herdr](https://herdr.dev)** on `PATH`, with Pi running inside a Herdr-managed pane (`HERDR_ENV=1` and `HERDR_WORKSPACE_ID` set)
-- **Cursor agent CLI** on `PATH` (`agent --version`), authenticated for ACP (`agent acp`)
-- Node.js `>=22` for local development and tests
+- Pi `>=0.80.4`
+- Node.js `>=22.19`
+- [Herdr](https://herdr.dev), with Pi running in a Herdr pane
+- Cursor agent CLI (`agent acp`) for the `cursor` backend
 
 ## Install
 
-Pinned v0.1.1 from Git:
-
 ```bash
-pi install git:github.com/bstncartwright/pi-bstn-subagents@v0.1.1
+pi install git:github.com/bstncartwright/pi-bstn-subagents@v0.2.0
 ```
 
 Project-local:
 
 ```bash
-pi install -l git:github.com/bstncartwright/pi-bstn-subagents@v0.1.1
+pi install -l git:github.com/bstncartwright/pi-bstn-subagents@v0.2.0
 ```
 
-Try for one run without installing:
-
-```bash
-pi -e git:github.com/bstncartwright/pi-bstn-subagents@v0.1.1
-```
-
-From a local checkout:
+Local checkout:
 
 ```bash
 pi install /absolute/path/to/pi-bstn-subagents
-# or
-pi -e /absolute/path/to/pi-bstn-subagents
 ```
 
-If Pi is already running, reload with `/reload`.
+Run `/reload` after changing the installed package.
 
-### Migration from the old local extension
+## Tools
 
-If you previously used the auto-discovered copy at `~/.pi/agent/extensions/cursor-herdr-subagents/`, **remove that directory** (or move it aside) before relying on this package. Otherwise Pi can load both the old auto-allowing extension and this package, and behavior will be confusing or unsafe. After removal, install the package above and `/reload`.
+| Tool | Purpose |
+|---|---|
+| `spawn_agent` | Spawn a fresh-context Pi or Cursor ACP agent; `backend` is required |
+| `wait_agent` | Wait for one completion or Cursor permission request |
+| `wait_all_agents` | Wait for all selected agents; returns early for a permission request |
+| `list_agents` | List current-session agents or read-only history |
+| `read_agent_response` | Read the latest final response |
+| `send_message` | Steer Pi, cancel-and-correct Cursor, or start another settled turn |
+| `interrupt_agent` | Abort the active turn without closing the session |
+| `close_agent` | Permanently close the process and Herdr viewer |
+| `respond_agent_permission` | Approve once or reject a pending Cursor ACP permission request |
 
-If you installed this package under its former name, `pi-cursor-herdr-subagents`, uninstall or remove that package entry before installing `pi-bstn-subagents`. Pi treats them as separate packages and can otherwise register the `subagent` tool twice. Existing event logs remain in `~/.pi/agent/pi-cursor-herdr-subagents/`; the renamed package writes new logs under `~/.pi/agent/pi-bstn-subagents/`.
+The old `subagent` action tool remains as a deprecated compatibility shim for one release. It keeps its old automatic-delivery behavior; new code should use the focused tools above.
 
-When upgrading from `v0.1.0`, stop existing subagents and restart Pi once. The old runtime registered those viewer panes as Herdr agents; a full restart clears that legacy state before `v0.1.1` creates viewer-only tabs.
+### Spawn examples
 
-## Usage
+Pi backend:
 
-The package registers a `subagent` tool (generic name kept for compatibility) with actions:
+```json
+{
+  "task_name": "review/api",
+  "message": "Review the API changes and return findings with file paths.",
+  "backend": "pi"
+}
+```
 
-| Action | Purpose |
-|--------|---------|
-| `spawn` | Start a Cursor ACP session and Herdr viewer; submit the initial task |
-| `send` | Follow up on an existing session by id or exact display name |
-| `steer` | Cancel an active turn, then immediately start a corrective prompt |
-| `list` | List managed sessions (includes `permissionMode` and pending approval ids) |
-| `read` | Read the structured event log (defaults to 200 lines) |
-| `stop` | Terminate the ACP session and close its Herdr viewer |
-| `approve` / `reject` | Answer a pending approval routed to the parent Pi agent |
+Cursor ACP backend:
 
-Models:
+```json
+{
+  "task_name": "cursor-review",
+  "message": "Review the current diff.",
+  "backend": "cursor",
+  "cursor_model": "Grok 4.5 High",
+  "permission_mode": "agent"
+}
+```
 
-- `Auto` (default)
-- `Grok 4.5 High` — sets `model=grok-4.5`, `effort=high`, and `fast=false`
+There is deliberately no default backend. Callers must choose `pi` or `cursor` explicitly.
 
-### Parent check-ins and steering
+## Workflow
 
-Each spawn has a `checkInMinutes` setting. It defaults to `5`; set it to `0` to disable or to an integer from `1` through `60` to change the interval. While a turn remains active, each interval steers a message to the parent Pi agent asking it to read that subagent's event log. Pi can let the turn continue, stop it, or use `action=steer` with a corrective message.
+`spawn_agent` returns after the child starts and accepts its task. Results are not injected into the parent automatically:
 
-`action=steer` sends ACP `session/cancel`, suppresses the interrupted turn's normal result, and starts the corrective prompt after Cursor acknowledges cancellation. Use `send` for a ready subagent and `steer` only for one that is currently working.
+1. Spawn one or more agents.
+2. Continue independent parent work if useful.
+3. Call `wait_agent` or `wait_all_agents` when results are needed.
+4. Use `send_message` for follow-up work.
+5. Call `close_agent` when the session is no longer needed.
 
-### Permission modes
+Wait tools have no model-facing timeout and honor cancellation of their tool call.
 
-`permissionMode` is set per `spawn` (default **`agent`**):
+### Cursor permissions
+
+`permission_mode` applies only to Cursor:
 
 | Mode | Behavior |
-|------|----------|
-| `agent` | **Default.** Steer the request to the parent Pi agent. Pi must call `subagent action=approve` or `action=reject` with the supplied approval id. Approval selects only `allow-once`; persistent approval is impossible through this flow. Requests time out and reject after two minutes. |
-| `prompt` | Ask via Pi UI when `hasUI` is available. Cancel / timeout / non-UI rejects via offered `reject-once`, or `cancelled` if that option is absent. `allow-always` is never auto-selected; the user may still choose it explicitly in the UI. |
-| `allow-once` | Automatically select `allow-once` when offered (never `allow-always`). |
-| `deny` | Automatically select `reject-once` when offered, otherwise `cancelled`. |
+|---|---|
+| `agent` | Default. `wait_agent`/`wait_all_agents` returns a permission event; answer with `respond_agent_permission` and wait again |
+| `prompt` | Show a Pi UI selection when available |
+| `allow-once` | Automatically select only an offered one-time approval |
+| `deny` | Reject the request |
 
-Single-select `cursor/ask_question` prompts are shown in Pi UI when feasible. Multi-select (`allowMultiple`) and non-UI / cancel cases are skipped with an explicit reason — answers are never fabricated.
+Parent-agent approval can never grant persistent access. Requests time out and reject after two minutes.
 
-Example prompts for the parent Pi agent:
+### Steering differences
 
-- “Spawn a Cursor subagent named `reviewer` to review the current diff.”
-- “Spawn a Cursor subagent with permissionMode deny for a read-only check.”
-- “Spawn a Cursor subagent with permissionMode agent and decide its approval requests.”
-- “Send follow-up to subagent `reviewer`: also check the tests.”
-- “Steer subagent `reviewer`: stop editing the shared file and only review the diff.”
-- “List Cursor subagents.”
-- “Stop subagent `reviewer`.”
+Pi RPC supports queued steering during an active run. Cursor ACP currently does not expose equivalent steering, so `send_message` cancels the active Cursor prompt and starts the corrective prompt on the same ACP session after cancellation settles. `interrupt_agent` only cancels.
 
-`spawn` and `send` return after submission. Do not poll; completed turns are delivered automatically via steered custom messages (`cursor_subagent_result` / `cursor_subagent_status`).
+## Session ownership and persistence
 
-After handling a completed result, the parent Pi agent should call `stop` if it does not need a follow-up. A ready session that receives no follow-up is automatically stopped after 15 minutes, terminating Cursor ACP and closing its Herdr viewer. Sending a follow-up clears the old timeout; a new 15-minute timeout starts when that turn completes.
+Agent names are unique within a parent Pi session. `/reviewer` can exist in two parent sessions, but not twice in one session. Mutating tools only access the current parent session. `list_agents({"include_all": true})` is the sole cross-session operation and is read-only.
 
-Event logs are stored under Pi’s agent directory with private modes (`0700` dirs / `0600` logs):
+Runtime data is stored under:
 
 ```text
-~/.pi/agent/pi-bstn-subagents/<id>/events.log
+~/.pi/agent/pi-bstn-subagents/
+├── config.json
+├── agents/*.md
+└── runs/<parent-session-hash>/
+    ├── <id>.info.json
+    ├── <id>.events.log
+    ├── <id>.response.txt
+    └── <id>.session.jsonl   # Pi backend
 ```
 
-Logs intentionally omit raw tool inputs and redact permission payloads to title/kind. They can still contain prompts, streamed thoughts/assistant text, and paths you should treat as sensitive.
+Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
+
+Optional `config.json`:
+
+```json
+{
+  "storageDir": "~/tmp/pi-agent-runs",
+  "defaults": {
+    "skills": ["web-investigate"],
+    "extensions": ["@scope/pi-extra-tools"]
+  }
+}
+```
+
+Relative storage paths resolve from `~/.pi/agent/pi-bstn-subagents/`.
+
+## Agent templates
+
+Templates live in `~/.pi/agent/pi-bstn-subagents/agents/*.md`.
+
+Pi template:
+
+```md
+---
+name: reviewer
+backend: pi
+description: Focused code reviewer
+provider: openai-codex
+model: gpt-5.6-sol
+thinking: high
+tools: read,bash,grep,find,ls
+skills: web-investigate
+extensions: @scope/pi-extra-tools
+hint: Give this reviewer exact paths and a narrow scope.
+---
+
+Review the requested code. Return concise findings with exact file paths.
+```
+
+Cursor template:
+
+```md
+---
+name: cursor-reviewer
+backend: cursor
+description: Cursor ACP reviewer
+cursor_model: Grok 4.5 High
+permission_mode: agent
+---
+
+Review the requested code and prioritize correctness defects.
+```
+
+The explicit `backend` passed to `spawn_agent` must agree with the template. Pi templates may override provider/model, thinking, tools, skills, and installed extensions. Automatic child extension, skill, and prompt-template discovery is disabled.
+
+## UI and Herdr
+
+Every live backend gets a background Herdr event-viewer tab. These tabs are viewers only and are not registered as Herdr agents.
+
+- `/agents` browses current-session agents; press Tab for read-only history.
+- `/subagent <task-name>` opens one current-session agent.
+- In the overlay: Left/Right changes agents, `j`/`k` scrolls, `g`/`G` jumps, and `q` closes.
+
+The parent Herdr pane remains `working` while either backend has an outstanding turn.
 
 ## Security
 
-Pi packages run with your **full system permissions**. There is **no sandbox**: this extension spawns Cursor ACP in the requested working directory and can create/control Herdr viewer tabs (named with `tab create --label` only; no agent registration or badge metadata) in the current workspace.
+This package and every child agent run with your full system permissions. There is no sandbox.
 
-Additional notes:
+- Pi children load only explicitly selected skills/extensions, but their tools can still mutate the working tree.
+- Cursor ACP permission handling does not sandbox approved operations.
+- Event logs can contain prompts, thoughts, output, and paths. Permission payloads are redacted to summaries.
+- Cursor model changes temporarily touch `~/.cursor/cli-config.json`; the package restores and verifies the previous content.
 
-- Temporarily snapshots and restores `~/.cursor/cli-config.json` around ACP startup so model selection does not permanently change your Cursor CLI defaults. If the file did not exist beforehand, a file created during startup is removed on restore. Restoration **applies, waits briefly, and verifies** (original content or absence), retrying about **5** times before throwing an error that names the config path.
-- **Config race limitation:** restores are serialized inside this extension and verified with retries, but other Cursor/CLI processes can still rewrite `cli-config.json` concurrently and cause restore verification to fail. Treat that file as shared mutable state.
-- Default `permissionMode=agent` asks the parent model to approve once or reject. Existing sessions keep the mode they were spawned with.
-- `permissionMode=agent` delegates each decision to the parent model. Treat it as less restrictive than human `prompt`; although it cannot grant persistent access, an approved Cursor operation still runs with your full system permissions.
-- Plan-creation requests (`cursor/create_plan`) are still auto-accepted so planning turns can proceed; review plans in the Herdr viewer / final result.
+## Migration from 0.1.x
 
-Only install from sources you trust. Review the extension code before enabling it on sensitive repositories.
+- Stop old Cursor subagents before reloading.
+- Replace `subagent action=spawn/send/steer/...` with the focused tools.
+- Choose `backend` explicitly for every spawn.
+- Replace automatic result handling with `wait_agent` or `wait_all_agents`.
+- Existing flat event logs remain legacy history and are not imported into parent-session ownership.
 
-## Troubleshooting
-
-| Symptom | What to check |
-|---------|----------------|
-| `Cursor subagents require Pi to be running inside Herdr` | Start Pi from a Herdr pane so `HERDR_ENV=1` is set |
-| `HERDR_WORKSPACE_ID is unavailable` | Confirm Herdr injected workspace env; run `herdr pane current --current` |
-| `herdr CLI is unavailable` | Ensure `herdr` is on `PATH` (`herdr --version`) |
-| `Cursor agent CLI is unavailable` | Ensure `agent` is on `PATH` (`agent --version`) and you are logged in |
-| Permissions always rejected | Need Pi UI (`hasUI`) for human `prompt`, use `permissionMode=agent` for parent-agent decisions, or pass `permissionMode=allow-once` intentionally |
-| Duplicate / unexpected subagent tool | Remove the old local extension or former `pi-cursor-herdr-subagents` package entry, then reload |
-| Grok High config rejected / Fast forced | This package requests Cursor’s `parameterizedModelPicker` capability and asserts `fast=false`; update Cursor CLI if options are missing |
-| Viewer tab empty | Check the event log path returned by `spawn` / `list`; Herdr runs `tail -F` on that file |
-| Parent never receives a result | Confirm the session was not stopped early; use `subagent action=read` or inspect the event log |
+If the package was installed under `pi-cursor-herdr-subagents`, remove that package entry to avoid duplicate tools.
 
 ## Development
 
@@ -144,7 +208,9 @@ npm install
 npm run check
 ```
 
-`npm run check` typechecks with strict TypeScript and runs unit tests for the ACP client (mock stdio agent) and pure helpers.
+## Attribution
+
+The session-scoped tool and child-Pi process design is based on the MIT-licensed [`@ogulcancelik/pi-codex-subagents`](https://github.com/ogulcancelik/pi-extensions/tree/main/packages/pi-codex-subagents). See `THIRD_PARTY_NOTICES.md`.
 
 ## License
 

@@ -51,6 +51,12 @@ export interface StartedAcpSession {
 	sessionId: string;
 	model: CursorModel;
 	configOptions: any[];
+	agentCapabilities: Record<string, unknown>;
+	loaded: boolean;
+}
+
+export interface StartAcpSessionOptions {
+	sessionId?: string;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -111,7 +117,7 @@ export class CursorAcpClient {
 		return !!this.child && this.child.exitCode == null && !this.closed;
 	}
 
-	async start(model: CursorModel): Promise<StartedAcpSession> {
+	async start(model: CursorModel, options: StartAcpSessionOptions = {}): Promise<StartedAcpSession> {
 		if (this.child) throw new Error("Cursor ACP client is already started.");
 
 		this.child = spawn(this.agentCommand, this.agentArgs, {
@@ -130,7 +136,7 @@ export class CursorAcpClient {
 			this.handlers.onExit?.(code, signal);
 		});
 
-		await this.request("initialize", {
+		const initialized = await this.request("initialize", {
 			protocolVersion: 1,
 			clientCapabilities: {
 				fs: { readTextFile: false, writeTextFile: false },
@@ -141,20 +147,27 @@ export class CursorAcpClient {
 			},
 			clientInfo: {
 				name: PACKAGE_NAME,
-				title: "Pi Cursor Herdr Subagents",
+				title: "Pi BSTN Subagents",
 				version: PACKAGE_VERSION,
 			},
 		});
 
 		await this.request("authenticate", { methodId: "cursor_login" });
-		const created = await this.request("session/new", { cwd: this.cwd, mcpServers: [] });
-		const sessionId = created?.sessionId;
+		const loaded = typeof options.sessionId === "string" && options.sessionId.length > 0;
+		const created = loaded
+			? await this.request("session/load", {
+				cwd: this.cwd,
+				mcpServers: [],
+				sessionId: options.sessionId,
+			})
+			: await this.request("session/new", { cwd: this.cwd, mcpServers: [] });
+		const sessionId = loaded ? options.sessionId : created?.sessionId;
 		if (typeof sessionId !== "string" || !sessionId) {
 			throw new Error("Cursor ACP did not return a session id.");
 		}
 		this.sessionId = sessionId;
 
-		let configOptions = created.configOptions ?? [];
+		let configOptions = created?.configOptions ?? [];
 		if (model === "Auto") {
 			configOptions = await this.setConfig("model", "default");
 		} else {
@@ -172,7 +185,13 @@ export class CursorAcpClient {
 			}
 		}
 
-		return { sessionId, model, configOptions };
+		return {
+			sessionId,
+			model,
+			configOptions,
+			agentCapabilities: initialized?.agentCapabilities ?? {},
+			loaded,
+		};
 	}
 
 	async prompt(text: string): Promise<{ stopReason?: string }> {

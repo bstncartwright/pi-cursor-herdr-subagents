@@ -28,6 +28,7 @@ import {
 	type CursorModel,
 	type JsonRpcMessage,
 } from "./acp.ts";
+import { registerUnifiedSubagents } from "./unified.ts";
 import {
 	answeredAskQuestion,
 	ALLOW_ONCE_IDS,
@@ -1170,6 +1171,7 @@ function resultText(result: { content?: Array<{ type?: string; text?: string }> 
 
 export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 	runtime.pi = pi;
+	registerUnifiedSubagents(pi);
 
 	pi.on("session_start", (_event, ctx) => {
 		runtime.pi = pi;
@@ -1207,27 +1209,14 @@ export default function cursorHerdrSubagents(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subagent",
-		label: "Cursor Subagent",
+		label: "Legacy Cursor Subagent",
 		description:
-			"Manage interactive Cursor agents through ACP, with each agent visualized in a dedicated background Herdr event-viewer tab. " +
+			"Deprecated compatibility tool. Prefer spawn_agent, wait_agent, wait_all_agents, list_agents, read_agent_response, send_message, interrupt_agent, and close_agent. Manage interactive Cursor agents through ACP, with each agent visualized in a dedicated background Herdr event-viewer tab. " +
 			"Actions: spawn, send, steer, list, read, stop, approve, reject. spawn and send return after submission; steer cancels an active turn and starts a corrective prompt. Structured ACP thoughts, tool calls, todos, and streamed messages appear in the Herdr viewer. " +
 			"When a turn ends, the result is automatically steered back into Pi. The ACP session remains open for follow-ups for 15 minutes, then closes automatically. " +
 			"While a turn runs, checkInMinutes defaults to 5 and periodically steers a request for the parent Pi agent to inspect it; 0 disables check-ins. " +
 			"permissionMode defaults to agent, which routes each request back to the parent Pi agent to approve once or reject. Human Pi UI prompt, automatic allow-once, and deny modes are also supported. " +
 			"Models: Auto, or Grok 4.5 High with effort=high and Fast explicitly disabled. Returned output is capped at 2000 lines or 50KB.",
-		promptSnippet:
-			"Spawn and converse with Cursor ACP agents in Herdr. Completed turns are delivered automatically; stop sessions when finished, or they auto-close after 15 idle minutes.",
-		promptGuidelines: [
-			"Use subagent action=spawn to delegate independent work to Cursor ACP; choose only Auto or Grok 4.5 High.",
-			"Grok 4.5 High in subagent explicitly uses effort=high and fast=false; never substitute a Fast variant.",
-			"Default permissionMode is agent, so respond to each cursor_subagent_approval with subagent action=approve or action=reject. Use prompt for human Pi UI approval, or automatic allow-once/deny only when the user requests that policy.",
-			"When subagent permissionMode=agent sends a cursor_subagent_approval message, inspect its operation and promptly call subagent action=approve or action=reject with the exact target and approvalId. Agent approval is allow-once only.",
-			"When a cursor_subagent_checkin message arrives, use subagent action=read for that target and inspect the event log. If correction is needed, use action=steer with a corrective message to cancel and redirect the active turn, or action=stop; otherwise let it continue.",
-			"After subagent action=spawn or action=send, do not poll or sleep. The subagent tool automatically steers the completed turn back into Pi.",
-			"Use subagent action=send with the returned id for follow-ups; the same Cursor ACP session remains open.",
-			"After receiving a completed result, use subagent action=stop when no more follow-up is needed. Ready sessions also close automatically after 15 minutes without a follow-up.",
-			"Use subagent action=read only when the user asks to inspect the structured event log or when diagnosing a failed run.",
-		],
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

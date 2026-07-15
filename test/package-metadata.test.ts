@@ -24,6 +24,7 @@ test("package.json declares a git-installable pi package", () => {
 	assert.deepEqual(pkg.pi?.extensions, ["./extensions/index.ts"]);
 	assert.ok(pkg.files?.includes("extensions"));
 	assert.ok(pkg.files?.includes("LICENSE"));
+	assert.ok(pkg.files?.includes("THIRD_PARTY_NOTICES.md"));
 });
 
 test("peerDependencies follow Pi package guidance", () => {
@@ -46,5 +47,5 @@ test("ACP clientInfo version matches package.json", () => {
 	assert.match(acpSource, /PACKAGE_NAME/);
 	assert.match(acpSource, /PACKAGE_VERSION/);
 	assert.doesNotMatch(acpSource, /version:\s*"0\.1\.\d+"/);
-	assert.equal(pkg.version, "0.1.1");
+	assert.equal(pkg.version, "0.2.0");
 });

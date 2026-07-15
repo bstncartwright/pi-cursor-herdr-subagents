@@ -149,3 +149,23 @@ test("CursorAcpClient cancels an active turn and can prompt again", async () => 
 		await rm(cwd, { recursive: true, force: true });
 	}
 });
+
+test("CursorAcpClient reconnects with session/load when a session id is supplied", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-cursor-acp-"));
+	const client = new CursorAcpClient(cwd, {
+		agentCommand: process.execPath,
+		agentArgs: [mockAgent],
+		env: { PATH: process.env.PATH ?? "" },
+		requestTimeoutMs: 5_000,
+	});
+
+	try {
+		const started = await client.start("Auto", { sessionId: "sess_test_1" });
+		assert.equal(started.loaded, true);
+		assert.equal(started.sessionId, "sess_test_1");
+		assert.equal(started.agentCapabilities.loadSession, true);
+	} finally {
+		await client.close();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});

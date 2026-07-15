@@ -47,6 +47,7 @@ async function handle(message) {
 				id,
 				result: {
 					protocolVersion: 1,
+					agentCapabilities: { loadSession: true, sessionCapabilities: { list: {} } },
 					agentInfo: { name: "mock-cursor-acp", version: "0.0.0" },
 				},
 			});
@@ -60,6 +61,13 @@ async function handle(message) {
 				id,
 				result: { sessionId, configOptions: configOptions() },
 			});
+			return;
+		case "session/load":
+			if (params.sessionId !== sessionId) {
+				write({ jsonrpc: "2.0", id, error: { code: -32000, message: "unknown session" } });
+				return;
+			}
+			write({ jsonrpc: "2.0", id, result: { configOptions: configOptions() } });
 			return;
 		case "session/set_config_option": {
 			config.set(params.configId, params.value);

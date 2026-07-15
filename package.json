@@ -1,7 +1,7 @@
 {
 	"name": "pi-bstn-subagents",
-	"version": "0.1.1",
-	"description": "Manage interactive Cursor ACP subagents from Pi, with each session visualized in a Herdr event-viewer tab.",
+	"version": "0.2.0",
+	"description": "Session-scoped Pi and Cursor ACP subagents with explicit waits, Herdr viewers, templates, and live overlays.",
 	"type": "module",
 	"license": "MIT",
 	"author": "Boston Cartwright",
@@ -12,7 +12,8 @@
 		"cursor",
 		"acp",
 		"herdr",
-		"subagent"
+		"subagent",
+		"multi-agent"
 	],
 	"homepage": "https://github.com/bstncartwright/pi-bstn-subagents#readme",
 	"repository": {
@@ -25,7 +26,8 @@
 	"files": [
 		"extensions",
 		"README.md",
-		"LICENSE"
+		"LICENSE",
+		"THIRD_PARTY_NOTICES.md"
 	],
 	"publishConfig": {
 		"access": "public"
@@ -47,10 +49,18 @@
 		"typebox": "*"
 	},
 	"peerDependenciesMeta": {
-		"@earendil-works/pi-ai": { "optional": true },
-		"@earendil-works/pi-coding-agent": { "optional": true },
-		"@earendil-works/pi-tui": { "optional": true },
-		"typebox": { "optional": true }
+		"@earendil-works/pi-ai": {
+			"optional": true
+		},
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		},
+		"@earendil-works/pi-tui": {
+			"optional": true
+		},
+		"typebox": {
+			"optional": true
+		}
 	},
 	"devDependencies": {
 		"@earendil-works/pi-ai": "0.80.6",
@@ -61,6 +71,6 @@
 		"typescript": "^5.9.3"
 	},
 	"engines": {
-		"node": ">=22"
+		"node": ">=22.19"
 	}
 }
