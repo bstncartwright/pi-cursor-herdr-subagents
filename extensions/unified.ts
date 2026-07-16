@@ -35,7 +35,6 @@ import {
 import { Text, matchesKey, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
-	CURSOR_MODEL_IDS,
 	DEFAULT_CURSOR_MODEL,
 	CursorAcpClient,
 	isCursorModel,
@@ -44,6 +43,7 @@ import {
 	type JsonRpcMessage,
 } from "./acp.ts";
 import { listSubagentModels, subagentModelToolResult } from "./model-catalog.ts";
+import { Mailbox, resolveAndSettlePermission, type MailEvent as MailboxEvent, type PermissionMailKey } from "./mailbox.ts";
 import {
 	ALLOW_ONCE_IDS,
 	cancelledPermissionResult,
@@ -75,6 +75,12 @@ const FINAL = new Set<AgentStatus>(["completed", "failed", "interrupted", "close
 export type AgentBackend = "pi" | "cursor";
 export type AgentStatus = "starting" | "running" | "completed" | "failed" | "interrupted" | "closed";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export function requirePendingApproval<T>(pendingApprovals: ReadonlyMap<string, T>, approvalId: string, agentName: string): T {
+	const pending = pendingApprovals.get(approvalId);
+	if (!pending) throw new Error(`No pending approval ${JSON.stringify(approvalId)} for ${agentName}.`);
+	return pending;
+}
 
 export interface AgentTemplate {
 	name: string;
@@ -180,6 +186,8 @@ interface Config {
 	};
 }
 
+type MailEvent = MailboxEvent<AgentStatus>;
+
 interface PendingRequest {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
@@ -211,19 +219,6 @@ interface RuntimeHandle {
 	pendingApprovals: Map<string, PendingApproval>;
 }
 
-interface MailEvent {
-	id: string;
-	parentSessionId: string;
-	agentName: string;
-	kind: "completion" | "permission";
-	status: AgentStatus;
-	finalResponse?: string;
-	error?: string;
-	approvalId?: string;
-	summary?: string;
-	allowOnceOffered?: boolean;
-	createdAt: number;
-}
 
 interface Waiter {
 	parentSessionId: string;
@@ -245,7 +240,7 @@ interface SpawnParams {
 	cwd?: string;
 	pi_model?: string;
 	pi_thinking?: ThinkingLevel;
-	cursor_model?: CursorModel;
+	cursor_model?: string;
 	permission_mode?: PermissionMode;
 }
 
@@ -448,6 +443,24 @@ export function validateSpawnPiOptions(
 	if (backend === "cursor" && (options.pi_model !== undefined || options.pi_thinking !== undefined)) {
 		throw new Error("pi_model and pi_thinking are only valid when backend=pi.");
 	}
+}
+
+/** Validate an exact Cursor preset discovered through list_subagent_models. */
+export function requireCursorModel(value: unknown): CursorModel {
+	if (!isCursorModel(value)) {
+		throw new Error("Invalid cursor_model. Use list_subagent_models for an exact supported value.");
+	}
+	return value;
+}
+
+/** Cursor uses explicit spawn > parsed template > default; Pi intentionally ignores this field. */
+export function resolveCursorSpawnModel(
+	backend: AgentBackend,
+	cursorModel: unknown,
+	template?: Pick<AgentTemplate, "cursorModel">,
+): CursorModel | undefined {
+	if (backend === "pi") return undefined;
+	return requireCursorModel(cursorModel === undefined ? template?.cursorModel ?? DEFAULT_CURSOR_MODEL : cursorModel);
 }
 
 export function parseAgentTemplateText(text: string, fallbackName: string): AgentTemplate {
@@ -784,7 +797,7 @@ class PiRpcClient {
 class UnifiedManager {
 	private readonly pi: ExtensionAPI;
 	private readonly live = new Map<string, RuntimeHandle>();
-	private readonly mailbox: MailEvent[] = [];
+	private readonly mailbox = new Mailbox<AgentStatus>();
 	private waiters: Waiter[] = [];
 	private readonly waitAllScopes = new Set<WaitAllScope>();
 	private readonly idleCloseTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; completedAt: number }>();
@@ -852,6 +865,7 @@ class UnifiedManager {
 		if (piSelection) {
 			validatePiModelSelection(piSelection, (provider, modelId) => ctx.modelRegistry.find(provider, modelId));
 		}
+		const cursorModel = resolveCursorSpawnModel(params.backend, params.cursor_model, template);
 		await this.ensurePrerequisites(params.backend, cwd);
 		const parentSessionId = this.parentSessionId(ctx);
 		if (readScope(parentSessionId).filter((info) => info.status !== "closed").length >= MAX_AGENTS) {
@@ -873,7 +887,6 @@ class UnifiedManager {
 			const id = randomUUID();
 			const prefix = join(dir, id);
 			const now = Date.now();
-			const cursorModel = params.cursor_model ?? template?.cursorModel ?? DEFAULT_CURSOR_MODEL;
 			const config = readJson<Config>(CONFIG_PATH) ?? {};
 			const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined;
 			const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined;
@@ -895,7 +908,7 @@ class UnifiedManager {
 				parentSessionFile: ctx.sessionManager.getSessionFile?.(),
 				agentType: params.agent_type,
 				cwd,
-				model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel,
+				model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL,
 				...(piSelection ? {
 					provider: piSelection.provider,
 					modelId: piSelection.modelId,
@@ -1035,13 +1048,14 @@ class UnifiedManager {
 	respondPermission(parentSessionId: string, target: string, approvalId: string, decision: "approve" | "reject"): void {
 		const info = this.get(target, parentSessionId);
 		const live = this.live.get(info.id);
-		const pending = live?.pendingApprovals.get(approvalId);
-		if (!live || !pending) throw new Error(`No pending approval ${JSON.stringify(approvalId)} for ${info.canonicalName}.`);
-		const result = resolveAgentPermissionDecision(decision, pending.options);
-		clearTimeout(pending.timer);
-		live.pendingApprovals.delete(approvalId);
-		pending.resolve(result);
-		log(info, "permission", `${approvalId} ${decision === "approve" ? "approved once" : "rejected"}`);
+		if (!live) throw new Error(`No pending approval ${JSON.stringify(approvalId)} for ${info.canonicalName}.`);
+		const pending = requirePendingApproval(live.pendingApprovals, approvalId, info.canonicalName);
+		this.settleApproval(
+			live,
+			pending,
+			() => resolveAgentPermissionDecision(decision, pending.options),
+			`${approvalId} ${decision === "approve" ? "approved once" : "rejected"}`,
+		);
 		this.updateWidget();
 	}
 
@@ -1053,8 +1067,11 @@ class UnifiedManager {
 
 	async waitAgent(parentSessionId: string, targets: string[] | undefined, signal?: AbortSignal): Promise<MailEvent> {
 		const normalized = targets?.length ? new Set(targets.map((target) => `/${normalizeTaskName(target)}`)) : undefined;
-		const existingIndex = this.mailbox.findIndex((event) => event.parentSessionId === parentSessionId && (!normalized || normalized.has(event.agentName)));
-		if (existingIndex >= 0) return this.mailbox.splice(existingIndex, 1)[0]!;
+		const existing = this.mailbox.claim(
+			(event) => event.parentSessionId === parentSessionId && (!normalized || normalized.has(event.agentName)),
+			(event) => this.isPermissionPending(event),
+		);
+		if (existing) return existing;
 		if (normalized) {
 			const infos = readScope(parentSessionId).filter((info) => normalized.has(info.canonicalName));
 			if (!infos.length) throw new Error(`No matching agents in this parent session: ${[...normalized].join(", ")}`);
@@ -1091,15 +1108,17 @@ class UnifiedManager {
 		try {
 			for (;;) {
 				if (signal?.aborted) throw signal.reason;
-				const permissionIndex = this.mailbox.findIndex((event) => event.kind === "permission" && event.parentSessionId === parentSessionId && names.has(event.agentName));
-				if (permissionIndex >= 0) return { event: this.mailbox.splice(permissionIndex, 1)[0]! };
+				const permission = this.mailbox.claim(
+					(event) => event.kind === "permission" && event.parentSessionId === parentSessionId && names.has(event.agentName),
+					(event) => this.isPermissionPending(event),
+				);
+				if (permission) return { event: permission };
 				const infos = readScope(parentSessionId).filter((info) => names.has(info.canonicalName));
 				if (infos.every((info) => FINAL.has(info.status))) {
 					for (const info of infos) this.defaultWaitTargets.get(parentSessionId)?.delete(info.canonicalName);
-					for (let index = this.mailbox.length - 1; index >= 0; index--) {
-						const event = this.mailbox[index]!;
-						if (event.parentSessionId === parentSessionId && names.has(event.agentName) && event.kind === "completion") this.mailbox.splice(index, 1);
-					}
+					this.mailbox.remove((event) =>
+						event.parentSessionId === parentSessionId && names.has(event.agentName) && event.kind === "completion"
+					);
 					return { infos };
 				}
 				await delay(250, undefined, signal ? { signal } : undefined);
@@ -1411,9 +1430,14 @@ class UnifiedManager {
 		const allowOnceOffered = !!findPermissionOptionId(options, ALLOW_ONCE_IDS);
 		return new Promise((resolvePermission) => {
 			const timer = setTimeout(() => {
-				live.pendingApprovals.delete(approvalId);
-				resolvePermission(rejectPermissionResult(options));
-				log(live.info, "permission", `${approvalId} timed out and was rejected`);
+				const pending = live.pendingApprovals.get(approvalId);
+				if (!pending) return;
+				this.settleApproval(
+					live,
+					pending,
+					() => rejectPermissionResult(options),
+					`${approvalId} timed out and was rejected`,
+				);
 				this.updateWidget();
 			}, PERMISSION_TIMEOUT_MS);
 			timer.unref?.();
@@ -1437,6 +1461,7 @@ class UnifiedManager {
 		if (live.closing || !live.pending) return;
 		live.pending = false;
 		live.activeTools.clear();
+		this.rejectApprovals(live, false, "agent completed");
 		live.promptPermissionPending = false;
 		live.info.status = status;
 		live.info.finalResponse = output.trim();
@@ -1465,11 +1490,10 @@ class UnifiedManager {
 	}
 
 	private pushMail(event: MailEvent, notifyParent = true): void {
+		if (event.kind === "permission" && !this.isPermissionPending(event)) return;
 		if (event.kind === "completion") {
-			for (let index = this.mailbox.length - 1; index >= 0; index--) {
-				const old = this.mailbox[index]!;
-				if (old.kind === "completion" && old.parentSessionId === event.parentSessionId && old.agentName === event.agentName) this.mailbox.splice(index, 1);
-			}
+			this.mailbox.remove((old) => old.kind === "completion"
+				&& old.parentSessionId === event.parentSessionId && old.agentName === event.agentName);
 		}
 		const waiterIndex = this.waiters.findIndex((waiter) => waiter.parentSessionId === event.parentSessionId && (!waiter.targets || waiter.targets.has(event.agentName)));
 		if (waiterIndex >= 0) {
@@ -1512,14 +1536,44 @@ class UnifiedManager {
 		}, { triggerTurn: true, deliverAs: "followUp" });
 	}
 
+	private permissionMailKey(live: RuntimeHandle, approvalId: string): PermissionMailKey {
+		return { parentSessionId: live.info.parentSessionId, agentName: live.info.canonicalName, approvalId };
+	}
+
+	private isPermissionPending(event: MailEvent): boolean {
+		if (event.kind !== "permission" || !event.approvalId) return false;
+		return [...this.live.values()].some((live) =>
+			live.info.parentSessionId === event.parentSessionId
+			&& live.info.canonicalName === event.agentName
+			&& live.pendingApprovals.has(event.approvalId!)
+		);
+	}
+
+	private settleApproval<T>(live: RuntimeHandle, approval: PendingApproval, resolveDecision: () => T, note: string): T {
+		const decision = resolveAndSettlePermission(
+			this.mailbox,
+			this.permissionMailKey(live, approval.id),
+			resolveDecision,
+			(decision) => {
+				clearTimeout(approval.timer);
+				live.pendingApprovals.delete(approval.id);
+				approval.resolve(decision);
+			},
+		);
+		log(live.info, "permission", note);
+		return decision;
+	}
+
 	private rejectApprovals(live: RuntimeHandle, cancelled: boolean, reason: string): void {
 		const hadApprovals = live.pendingApprovals.size > 0 || live.promptPermissionPending;
-		for (const approval of live.pendingApprovals.values()) {
-			clearTimeout(approval.timer);
-			approval.resolve(cancelled ? cancelledPermissionResult() : rejectPermissionResult(approval.options));
-			log(live.info, "permission", `${approval.id} ${cancelled ? "cancelled" : "rejected"}: ${reason}`);
+		for (const approval of [...live.pendingApprovals.values()]) {
+			this.settleApproval(
+				live,
+				approval,
+				() => cancelled ? cancelledPermissionResult() : rejectPermissionResult(approval.options),
+				`${approval.id} ${cancelled ? "cancelled" : "rejected"}: ${reason}`,
+			);
 		}
-		live.pendingApprovals.clear();
 		live.promptPermissionPending = false;
 		if (hadApprovals) this.updateWidget();
 	}
@@ -1527,9 +1581,10 @@ class UnifiedManager {
 	private handleRuntimeExit(live: RuntimeHandle, error?: Error): void {
 		if (live.closing) return;
 		this.live.delete(live.info.id);
-		if (live.pending && !FINAL.has(live.info.status)) {
-			live.pending = false;
-			this.rejectApprovals(live, false, "runtime exited");
+		const wasPending = live.pending;
+		live.pending = false;
+		this.rejectApprovals(live, false, "runtime exited");
+		if (wasPending && !FINAL.has(live.info.status)) {
 			live.info.status = "failed";
 			live.info.error = error?.message ?? "Subagent runtime exited unexpectedly.";
 			live.info.completedAt = Date.now();
@@ -1542,12 +1597,8 @@ class UnifiedManager {
 	}
 
 	private clearCompletionMail(info: AgentInfo): void {
-		for (let index = this.mailbox.length - 1; index >= 0; index--) {
-			const event = this.mailbox[index]!;
-			if (event.kind === "completion" && event.parentSessionId === info.parentSessionId && event.agentName === info.canonicalName) {
-				this.mailbox.splice(index, 1);
-			}
-		}
+		this.mailbox.remove((event) => event.kind === "completion"
+			&& event.parentSessionId === info.parentSessionId && event.agentName === info.canonicalName);
 	}
 
 	private clearIdleClose(id: string): void {
@@ -1750,7 +1801,6 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 	const manager = new UnifiedManager(pi);
 	const Backend = StringEnum(["pi", "cursor"] as const, { description: "Required runtime backend. Choose explicitly." });
 	const PiThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Explicit Pi thinking level. Invalid for Cursor." });
-	const CursorModelSchema = StringEnum(CURSOR_MODEL_IDS);
 	const PermissionSchema = StringEnum(["agent", "prompt", "allow-once", "deny"] as const);
 	const SpawnSchema = Type.Object({
 		task_name: Type.String({ description: "Session-scoped task name; slash-separated names are allowed." }),
@@ -1761,7 +1811,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI): void {
 		cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to parent cwd." })),
 		pi_model: Type.Optional(Type.String({ description: "Pi model in exact provider/model-id format. Split at the first slash; later slashes and colons remain part of the model id. Invalid for Cursor." })),
 		pi_thinking: Type.Optional(PiThinkingSchema),
-		cursor_model: Type.Optional(CursorModelSchema),
+		cursor_model: Type.Optional(Type.String({ description: "Cursor model string. Use list_subagent_models for exact supported values." })),
 		permission_mode: Type.Optional(PermissionSchema),
 	});
 	const TargetSchema = Type.Object({ target: Type.String({ description: "Session-owned agent task name." }) });

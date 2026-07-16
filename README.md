@@ -131,6 +131,8 @@ Cursor ACP backend:
 
 There is deliberately no default backend. Callers must choose `pi` or `cursor` explicitly. `pi_model` and `pi_thinking` are rejected when `backend` is `cursor`.
 
+`cursor_model` intentionally uses an open-string schema to avoid biasing discovery. Its value must exactly match `list_subagent_models` output; Cursor validates it before prerequisites or ACP start. For compatibility, Pi ignores `cursor_model`, including invalid values.
+
 ### Pi model and thinking precedence
 
 Both Pi settings are optional and resolve independently:

@@ -11,6 +11,8 @@ import {
 	parseAgentTemplateText,
 	parsePiModel,
 	resolvePiSpawnSelection,
+	requireCursorModel,
+	resolveCursorSpawnModel,
 	selectInheritedPiTools,
 	validatePiModelSelection,
 	validateSpawnPiOptions,
@@ -57,6 +59,16 @@ Review carefully.`, "fallback");
 		permissionMode: "deny",
 		prompt: "Review carefully.",
 	});
+});
+
+test("invalid template cursor_model values are silently dropped", () => {
+	const template = parseAgentTemplateText(`---
+name: invalid-cursor-model
+backend: cursor
+cursor_model: not-a-cursor-preset
+---
+Review carefully.`, "fallback");
+	assert.equal(template.cursorModel, undefined);
 });
 
 test("pi_model parsing trims and splits only at the first slash", () => {
@@ -187,6 +199,32 @@ test("Pi-only spawn fields are rejected for Cursor", () => {
 	assert.doesNotThrow(() => validateSpawnPiOptions("pi", { pi_model: "provider/model", pi_thinking: "max" }));
 });
 
+test("Cursor model runtime validation accepts supported values without exposing a preset list", () => {
+	assert.equal(requireCursorModel("Auto"), "Auto");
+	assert.equal(requireCursorModel("Grok 4.5 High"), "Grok 4.5 High");
+	let errorMessage = "";
+	assert.throws(() => requireCursorModel("invalid"), (error: unknown) => {
+		errorMessage = error instanceof Error ? error.message : String(error);
+		return true;
+	});
+	assert.match(errorMessage, /list_subagent_models/);
+	assert.doesNotMatch(errorMessage, /Auto|Grok/);
+	for (const value of [undefined, "auto", 42]) {
+		assert.throws(() => requireCursorModel(value), /list_subagent_models/);
+	}
+});
+
+test("Cursor model resolution uses explicit, parsed template, then default precedence", () => {
+	assert.equal(resolveCursorSpawnModel("cursor", "Auto", { cursorModel: "Grok 4.5 High" }), "Auto");
+	assert.equal(resolveCursorSpawnModel("cursor", undefined, { cursorModel: "Grok 4.5 High" }), "Grok 4.5 High");
+	assert.equal(resolveCursorSpawnModel("cursor", undefined), "Auto");
+	assert.throws(() => resolveCursorSpawnModel("cursor", "invalid"), /list_subagent_models/);
+});
+
+test("Pi ignores cursor_model, including invalid values, for compatibility", () => {
+	assert.equal(resolveCursorSpawnModel("pi", "invalid", { cursorModel: "Grok 4.5 High" }), undefined);
+});
+
 test("focused tool contract requires an explicit backend and keeps Cursor on ACP", async () => {
 	const { readFile } = await import("node:fs/promises");
 	const source = await readFile(new URL("../extensions/unified.ts", import.meta.url), "utf8");
@@ -206,7 +244,9 @@ test("focused tool contract requires an explicit backend and keeps Cursor on ACP
 	assert.doesNotMatch(source, /backend:\s*Type\.Optional\(Backend\)/);
 	assert.match(source, /pi_model: Type\.Optional\(Type\.String/);
 	assert.match(source, /pi_thinking: Type\.Optional\(PiThinkingSchema\)/);
-	assert.match(source, /const CursorModelSchema = StringEnum\(CURSOR_MODEL_IDS\)/);
+	assert.match(source, /cursor_model: Type\.Optional\(Type\.String\(\{ description: "Cursor model string\. Use list_subagent_models for exact supported values\." \}\)\)/);
+	assert.doesNotMatch(source, /CURSOR_MODEL_IDS/);
+	assert.match(source, /const cursorModel = resolveCursorSpawnModel\(params\.backend, params\.cursor_model, template\);[\s\S]*await this\.ensurePrerequisites\(params\.backend, cwd\)/);
 	assert.match(source, /backend: Type\.Optional\(Type\.String/);
 	assert.match(source, /offset: Type\.Optional\(Type\.Integer\(\{ minimum: 0/);
 	assert.match(source, /limit: Type\.Optional\(Type\.Integer\(\{ minimum: 1, maximum: 100/);
