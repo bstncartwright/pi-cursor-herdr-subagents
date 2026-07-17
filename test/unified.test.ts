@@ -23,6 +23,7 @@ import {
 	selectInheritedPiTools,
 	validatePiModelSelection,
 	validateSpawnPiOptions,
+	validateTemplateBackendOptions,
 	SUBAGENT_IDLE_CLOSE_MS,
 	taskStorageKey,
 } from "../extensions/unified.ts";
@@ -78,6 +79,13 @@ cursor_model: not-a-cursor-preset
 ---
 Review carefully.`, "fallback");
 	assert.equal(template.cursorModel, undefined);
+});
+
+test("templates reject settings that do not belong to the selected backend", () => {
+	assert.throws(() => validateTemplateBackendOptions("cursor", { name: "bad-cursor", skills: ["local"] }), /Pi-only/);
+	assert.throws(() => validateTemplateBackendOptions("pi", { name: "bad-pi", cursorModel: "Auto" }), /cursor_model/);
+	assert.doesNotThrow(() => validateTemplateBackendOptions("cursor", { name: "cursor", cursorModel: "Auto", permissionMode: "deny" }));
+	assert.doesNotThrow(() => validateTemplateBackendOptions("pi", { name: "pi", skills: ["local"], permissionMode: "deny" }));
 });
 
 test("pi_model parsing trims and splits only at the first slash", () => {

@@ -7,13 +7,14 @@ import {
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	renameSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -23,7 +24,6 @@ import {
 	DEFAULT_MAX_LINES,
 	formatSize,
 	getAgentDir,
-	parseFrontmatter,
 	truncateHead,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
@@ -40,6 +40,13 @@ import {
 	type JsonRpcMessage,
 } from "./acp.ts";
 import { listSubagentModels, subagentModelToolResult } from "./model-catalog.ts";
+import {
+	buildAgentTemplateCatalog,
+	publicAgentTemplateCatalog,
+	resolveAgentTemplate,
+	type AgentTemplate,
+	type AgentTemplateCatalog,
+} from "./agent-templates.ts";
 import { Mailbox, resolveAndSettlePermission, type MailEvent as MailboxEvent } from "./mailbox.ts";
 import {
 	createRunLedgerState,
@@ -84,6 +91,8 @@ import {
 } from "./turn-manifest.ts";
 export { JsonlDecoder, normalizePiCompactionEvent, normalizePiRpcToolEvent };
 export type { NormalizedBackendToolEvent };
+export { parseAgentTemplateText } from "./agent-templates.ts";
+export type { AgentTemplate } from "./agent-templates.ts";
 
 const ROOT = join(getAgentDir(), PACKAGE_NAME);
 const CONFIG_PATH = join(ROOT, "config.json");
@@ -114,22 +123,6 @@ export function requirePendingApproval<T>(pendingApprovals: ReadonlyMap<string, 
 	const pending = pendingApprovals.get(approvalId);
 	if (!pending) throw new Error(`No pending approval ${JSON.stringify(approvalId)} for ${agentName}.`);
 	return pending;
-}
-
-export interface AgentTemplate {
-	name: string;
-	description?: string;
-	hint?: string;
-	backend?: AgentBackend;
-	provider?: string;
-	model?: string;
-	thinking?: ThinkingLevel;
-	tools?: string;
-	skills?: string[];
-	extensions?: string[];
-	cursorModel?: CursorModel;
-	permissionMode?: PermissionMode;
-	prompt?: string;
 }
 
 export interface AgentInfo {
@@ -252,6 +245,7 @@ export function agentActivitySummary(
 
 interface Config {
 	storageDir?: string;
+	trustedProjects?: string[];
 	defaults?: {
 		skills?: string[];
 		extensions?: string[];
@@ -351,44 +345,46 @@ function expandHome(value: string): string {
 	return value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
 }
 
-function resolveSkillPath(value: string, cwd: string): string {
+interface ResourceResolutionPolicy { projectRoot?: string; includeProject: boolean; }
+
+function containedBy(path: string, root: string): boolean { return path === root || path.startsWith(`${root}${sep}`); }
+
+function canonicalExisting(path: string): string | undefined { try { return realpathSync(path); } catch { return undefined; } }
+
+function resolveSkillPath(value: string, cwd: string, policy: ResourceResolutionPolicy): string {
 	const expanded = expandHome(value);
 	if (isAbsolute(expanded) || expanded.startsWith(".")) {
-		const candidate = resolve(cwd, expanded);
-		if (existsSync(candidate)) return candidate;
+		const candidate = canonicalExisting(resolve(cwd, expanded));
+		const globalRoots = [canonicalExisting(join(getAgentDir(), "skills")), canonicalExisting(join(homedir(), ".agents", "skills"))].filter((entry): entry is string => !!entry);
+		if (candidate && (globalRoots.some((root) => containedBy(candidate, root)) || !!policy.projectRoot && policy.includeProject && containedBy(candidate, policy.projectRoot))) return candidate;
 		throw new Error(`Skill path not found: ${value}`);
 	}
-	const roots = [join(getAgentDir(), "skills"), join(homedir(), ".agents", "skills")];
-	let current = cwd;
-	for (;;) {
-		roots.push(join(current, CONFIG_DIR_NAME, "skills"), join(current, ".agents", "skills"));
-		const parent = resolve(current, "..");
-		if (parent === current) break;
-		current = parent;
-	}
+	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) throw new Error(`Invalid skill name: ${value}`);
+	const roots = [...(policy.includeProject && policy.projectRoot ? [join(policy.projectRoot, CONFIG_DIR_NAME, "skills"), join(policy.projectRoot, ".agents", "skills")] : []), join(getAgentDir(), "skills"), join(homedir(), ".agents", "skills")];
 	for (const root of roots) {
+		const canonicalRoot = canonicalExisting(root); if (!canonicalRoot) continue;
 		const directory = join(root, value);
-		if (existsSync(join(directory, "SKILL.md"))) return directory;
+		if (existsSync(join(directory, "SKILL.md"))) { const candidate = realpathSync(directory); const marker = realpathSync(join(directory, "SKILL.md")); if (containedBy(candidate, canonicalRoot) && containedBy(marker, canonicalRoot)) return candidate; }
 		const markdown = join(root, `${value}.md`);
-		if (existsSync(markdown)) return markdown;
+		if (existsSync(markdown)) { const candidate = realpathSync(markdown); if (containedBy(candidate, canonicalRoot)) return candidate; }
 	}
 	throw new Error(`Skill not found: ${value}`);
 }
 
-function resolveExtensionPath(value: string, cwd: string): string {
+function resolveExtensionPath(value: string, cwd: string, policy: ResourceResolutionPolicy): string {
 	const expanded = expandHome(value);
 	if (isAbsolute(expanded) || expanded.startsWith(".")) {
-		const candidate = resolve(cwd, expanded);
-		if (existsSync(candidate)) return candidate;
+		const candidate = canonicalExisting(resolve(cwd, expanded)); const globalRoot = canonicalExisting(join(getAgentDir(), "npm", "node_modules"));
+		if (candidate && (!!globalRoot && containedBy(candidate, globalRoot) || !!policy.projectRoot && policy.includeProject && containedBy(candidate, policy.projectRoot))) return candidate;
 		throw new Error(`Extension path not found: ${value}`);
 	}
-	const candidates = [
-		join(cwd, CONFIG_DIR_NAME, "npm", "node_modules", value),
-		join(getAgentDir(), "npm", "node_modules", value),
-	];
-	const candidate = candidates.find(existsSync);
-	if (!candidate) throw new Error(`Installed extension package not found: ${value}. Install it with pi install first.`);
-	return candidate;
+	if (!/^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) throw new Error(`Invalid extension package name: ${value}`);
+	const roots = [...(policy.includeProject && policy.projectRoot ? [join(policy.projectRoot, CONFIG_DIR_NAME, "npm", "node_modules")] : []), join(getAgentDir(), "npm", "node_modules")];
+	for (const root of roots) {
+		const canonicalRoot = canonicalExisting(root); const candidate = canonicalExisting(join(root, value));
+		if (canonicalRoot && candidate && containedBy(candidate, canonicalRoot)) return candidate;
+	}
+	throw new Error(`Installed extension package not found: ${value}. Install it with pi install first.`);
 }
 
 function runsDir(paths: UnifiedStoragePaths = PRODUCTION_PATHS): string {
@@ -433,12 +429,6 @@ export function selectInheritedPiTools(
 		.filter((tool) => tool.sourceInfo?.source === "builtin" && active.has(tool.name))
 		.map((tool) => tool.name);
 	return builtins.length ? builtins.join(",") : DEFAULT_PI_TOOLS;
-}
-
-function thinkingLevel(value: unknown): ThinkingLevel | undefined {
-	return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value))
-		? value as ThinkingLevel
-		: undefined;
 }
 
 export type PiModelSelectionSource = "explicit" | "template" | "parent";
@@ -528,6 +518,13 @@ export function validateSpawnPiOptions(
 	}
 }
 
+export function validateTemplateBackendOptions(backend: AgentBackend, template: AgentTemplate): void {
+	if (backend === "cursor" && [template.provider, template.model, template.thinking, template.tools, template.skills, template.extensions].some((value) => value !== undefined)) {
+		throw new Error(`Template ${template.name} contains Pi-only settings but backend=cursor.`);
+	}
+	if (backend === "pi" && template.cursorModel !== undefined) throw new Error(`Template ${template.name} contains cursor_model but backend=pi.`);
+}
+
 /** Validate an exact Cursor preset discovered through list_subagent_models. */
 export function requireCursorModel(value: unknown): CursorModel {
 	if (!isCursorModel(value)) {
@@ -544,51 +541,6 @@ export function resolveCursorSpawnModel(
 ): CursorModel | undefined {
 	if (backend === "pi") return undefined;
 	return requireCursorModel(cursorModel === undefined ? template?.cursorModel ?? DEFAULT_CURSOR_MODEL : cursorModel);
-}
-
-export function parseAgentTemplateText(text: string, fallbackName: string): AgentTemplate {
-	const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(text);
-	const backend = frontmatter.backend === "pi" || frontmatter.backend === "cursor" ? frontmatter.backend : undefined;
-	const cursorModel = isCursorModel(frontmatter.cursor_model) ? frontmatter.cursor_model : undefined;
-	const permissionMode = ["agent", "prompt", "allow-once", "deny"].includes(String(frontmatter.permission_mode))
-		? normalizePermissionMode(frontmatter.permission_mode)
-		: undefined;
-	return {
-		name: typeof frontmatter.name === "string" && frontmatter.name.trim() ? frontmatter.name.trim() : fallbackName,
-		description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
-		hint: typeof frontmatter.hint === "string" ? frontmatter.hint : undefined,
-		backend,
-		provider: typeof frontmatter.provider === "string" ? frontmatter.provider : undefined,
-		model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
-		thinking: thinkingLevel(frontmatter.thinking),
-		tools: typeof frontmatter.tools === "string" ? frontmatter.tools : undefined,
-		skills: stringList(frontmatter.skills),
-		extensions: stringList(frontmatter.extensions),
-		cursorModel,
-		permissionMode,
-		prompt: body.trim() || undefined,
-	};
-}
-
-export function listAgentTemplates(paths: UnifiedStoragePaths = PRODUCTION_PATHS): AgentTemplate[] {
-	ensureDir(paths.agentsDir);
-	return readdirSync(paths.agentsDir)
-		.filter((name) => name.endsWith(".md"))
-		.flatMap((name) => {
-			try { return [parseAgentTemplateText(readFileSync(join(paths.agentsDir, name), "utf8"), name.slice(0, -3))]; }
-			catch { return []; }
-		})
-		.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function templatesDescription(paths: UnifiedStoragePaths = PRODUCTION_PATHS): string {
-	const templates = listAgentTemplates(paths);
-	if (!templates.length) return `No templates found. Add Markdown templates to ${paths.agentsDir}.`;
-	return templates.map((template) => {
-		let line = `- \`${template.name}\`${template.backend ? ` [${template.backend}]` : ""}${template.description ? ` — ${template.description}` : ""}`;
-		if (template.hint) line += `\n  Caller hint: ${template.hint}`;
-		return line;
-	}).join("\n");
 }
 
 function log(info: Pick<AgentInfo, "logFile">, category: string, message: string): void {
@@ -861,8 +813,10 @@ class UnifiedManager {
 		this.refresh(); this.updateWidget(); if (!this.widgetTimer) { this.widgetTimer = setInterval(() => this.updateWidget(), 1000); this.widgetTimer.unref?.(); }
 	}
 	parentSessionId(ctx: ExtensionContext | ExtensionCommandContext): string { const id = ctx.sessionManager.getSessionId?.(); if (!id) throw new Error("The parent Pi session has no persistent session id."); return String(id); }
-	templateDescription(): string { return templatesDescription(this.paths); }
-	templateDirectory(): string { return this.paths.agentsDir; }
+	templateCatalog(ctx: ExtensionContext): AgentTemplateCatalog {
+		ensureDir(this.paths.agentsDir);
+		return buildAgentTemplateCatalog({ globalAgentsDir: this.paths.agentsDir, configPath: this.paths.configPath, cwd: ctx.cwd, piProjectTrusted: typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted() });
+	}
 	list(parent: string, includeAll = false, pathPrefix?: string): AgentInfo[] { const prefix = pathPrefix?.trim().replace(/^\/+/, ""); return (includeAll ? this.readAll() : this.readScope(parent)).filter((info) => !prefix || info.taskName.startsWith(prefix)); }
 	get(target: string, parent: string): AgentInfo { const name = normalizeTaskName(target); const info = this.readScope(parent).find((entry) => entry.taskName === name); if (!info) throw new Error(`Agent not found in this parent session: /${name}`); return info; }
 	overlayInfo(target: string, parent: string, readOnly: boolean): AgentInfo {
@@ -942,11 +896,23 @@ class UnifiedManager {
 	}
 	async spawn(params: SpawnParams, ctx: ExtensionContext): Promise<AgentInfo> {
 		validateSpawnPiOptions(params.backend, params); const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd; if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Agent cwd is not a directory: ${cwd}`);
-		const taskName = normalizeTaskName(params.task_name); const template = params.agent_type ? listAgentTemplates(this.paths).find((entry) => entry.name === params.agent_type) : undefined; if (params.agent_type && !template) throw new Error(`Agent template not found: ${params.agent_type}`); if (template?.backend && template.backend !== params.backend) throw new Error(`Template ${template.name} requires backend=${template.backend}, but spawn_agent received backend=${params.backend}.`);
+		const catalog = this.templateCatalog(ctx); const taskName = normalizeTaskName(params.task_name); const template = params.agent_type ? resolveAgentTemplate(catalog, params.agent_type) : undefined; if (template?.backend && template.backend !== params.backend) throw new Error(`Template ${template.name} requires backend=${template.backend}, but spawn_agent received backend=${params.backend}.`); if (template) validateTemplateBackendOptions(params.backend, template);
+		if (template?.scope === "project") { const canonicalCwd = realpathSync(cwd); if (!containedBy(canonicalCwd, catalog.projectRoot)) throw new Error("Project templates may only run inside their trusted project root."); }
 		const piSelection = params.backend === "pi" ? resolvePiSpawnSelection({ piModel: params.pi_model, piThinking: params.pi_thinking, template, parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined, parentThinking: this.pi.getThinkingLevel() as ThinkingLevel }) : undefined; if (piSelection) validatePiModelSelection(piSelection, (provider, modelId) => ctx.modelRegistry.find(provider, modelId)); const cursorModel = resolveCursorSpawnModel(params.backend, params.cursor_model, template);
-		await this.ensurePrerequisites(params.backend, cwd); const parent = this.parentSessionId(ctx); const manifest = this.manifest(parent); if (Object.values(manifest.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`); if (Object.values(manifest.agents).some((agent) => agent.taskName === taskName)) throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
-		const id = this.uuid(); const now = this.now(); const config = readJson<Config>(this.paths.configPath) ?? {}; const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined; const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined; const selectedSkills = params.backend === "pi" ? [...new Set([...(configuredSkills ?? []), ...(params.skills ?? [])])] : []; const selectedTools = params.backend === "pi" ? template?.tools ?? (configuredExtensions?.length ? undefined : selectInheritedPiTools(this.pi.getActiveTools(), this.pi.getAllTools())) : undefined;
-		const proto: Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed"> = { id, taskName, canonicalName: `/${taskName}`, backend: params.backend, parentSessionId: parent, parentSessionFile: ctx.sessionManager.getSessionFile?.(), agentType: params.agent_type, cwd, model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL, provider: piSelection?.provider, modelId: piSelection?.modelId, thinking: piSelection?.thinking, tools: selectedTools, skills: selectedSkills, skillPaths: selectedSkills.map((skill) => resolveSkillPath(skill, cwd)), extensions: configuredExtensions ?? [], extensionPaths: (configuredExtensions ?? []).map((extension) => resolveExtensionPath(extension, cwd)), cursorModel, permissionMode: normalizePermissionMode(params.permission_mode ?? template?.permissionMode), sessionFile: undefined, infoFile: "", logFile: "", responseFile: "", createdAt: now, updatedAt: now };
+		const parent = this.parentSessionId(ctx); const manifest = this.manifest(parent); if (Object.values(manifest.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`); if (Object.values(manifest.agents).some((agent) => agent.taskName === taskName)) throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
+		const id = this.uuid(); const now = this.now(); const config = readJson<Config>(this.paths.configPath) ?? {};
+		const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined;
+		const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined;
+		const selectedSkills = params.backend === "pi" ? [...new Set([...(configuredSkills ?? []), ...(params.skills ?? [])])] : [];
+		const selectedTools = params.backend === "pi" ? template?.tools ?? (configuredExtensions?.length ? undefined : selectInheritedPiTools(this.pi.getActiveTools(), this.pi.getAllTools())) : undefined;
+		const projectResourcesAllowed = catalog.projectStatus === "trusted" || catalog.projectStatus === "not-present";
+		const configuredPolicy: ResourceResolutionPolicy = { projectRoot: catalog.projectRoot, includeProject: template?.scope === "project" };
+		const explicitPolicy: ResourceResolutionPolicy = { projectRoot: catalog.projectRoot, includeProject: projectResourcesAllowed };
+		const configuredSkillSet = new Set(configuredSkills ?? []);
+		const skillPaths = selectedSkills.map((skill) => resolveSkillPath(skill, cwd, configuredSkillSet.has(skill) ? configuredPolicy : explicitPolicy));
+		const extensionPaths = (configuredExtensions ?? []).map((extension) => resolveExtensionPath(extension, cwd, configuredPolicy));
+		const proto: Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed"> = { id, taskName, canonicalName: `/${taskName}`, backend: params.backend, parentSessionId: parent, parentSessionFile: ctx.sessionManager.getSessionFile?.(), agentType: params.agent_type, cwd, model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL, provider: piSelection?.provider, modelId: piSelection?.modelId, thinking: piSelection?.thinking, tools: selectedTools, skills: selectedSkills, skillPaths, extensions: configuredExtensions ?? [], extensionPaths, cursorModel, permissionMode: normalizePermissionMode(params.permission_mode ?? template?.permissionMode), sessionFile: undefined, infoFile: "", logFile: "", responseFile: "", createdAt: now, updatedAt: now };
+		await this.ensurePrerequisites(params.backend, cwd);
 		const prompt = [template?.prompt, params.message].filter(Boolean).join("\n\n"); const turnId = this.uuid();
 		const queued = this.mutate(parent, (current) => {
 			if (Object.values(current.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
@@ -1464,7 +1430,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		task_name: Type.String({ description: "Session-scoped task name; slash-separated names are allowed." }),
 		message: Type.String({ description: "Initial concrete task." }),
 		backend: Backend,
-		agent_type: Type.Optional(Type.String({ description: `Optional template from ${manager.templateDirectory()}.` })),
+		agent_type: Type.Optional(Type.String({ description: "Optional lowercase ASCII template name. Use list_agent_templates for the effective trusted catalog." })),
 		skills: Type.Optional(Type.Array(Type.String(), { description: "Additional explicit Pi skills. Ignored by Cursor." })),
 		cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to parent cwd." })),
 		pi_model: Type.Optional(Type.String({ description: "Pi model in exact provider/model-id format. Split at the first slash; later slashes and colons remain part of the model id. Invalid for Cursor." })),
@@ -1477,13 +1443,12 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 	const spawnTool = {
 		name: "spawn_agent",
 		label: "Spawn Agent",
-		get description() {
-			return `Spawn a fresh-context Pi or Cursor ACP subagent. backend is required explicitly. Durably queues work and returns before runtime startup; use wait_agent or wait_all_agents for results. Queued work remains visible in Herdr; reload-paused work requires an explicit new message. For Pi, pi_model must be provider/model-id and pi_thinking selects reasoning effort; each independently uses explicit spawn > template > parent precedence. Pi-only fields are rejected for Cursor. Templates can configure backend-specific model, tools, skills, extensions, and prompts.\n\nAvailable templates:\n${templatesDescription()}`;
-		},
+		description: "Spawn a fresh-context Pi or Cursor ACP subagent. backend is required explicitly. Durably queues work and returns before runtime startup; use wait_agent or wait_all_agents for results. Queued work remains visible in Herdr; reload-paused work requires an explicit new message. For Pi, pi_model must be provider/model-id and pi_thinking selects reasoning effort; each independently uses explicit spawn > template > parent precedence. Pi-only fields are rejected for Cursor. Templates can configure backend-specific model, tools, skills, extensions, and prompts; discover the effective trusted catalog with list_agent_templates.",
 		promptSnippet: "Queue a session-scoped Pi or Cursor ACP agent; backend must be explicit.",
 		promptGuidelines: [
 			"Always pass backend=pi or backend=cursor explicitly to spawn_agent; never infer a hidden default.",
 			"Before spawn_agent selects a non-inherited model, use list_subagent_models to discover exact backend-specific spawn values and thinking controls.",
+			"Before using agent_type, call list_agent_templates; project templates are available only when both Pi trust and the package trustedProjects allowlist approve the canonical project root.",
 			"For spawn_agent backend=pi, use pi_model in exact provider/model-id format and pi_thinking only when overriding template or parent defaults. Model and thinking each resolve as explicit spawn > template > parent.",
 			"Never pass pi_model or pi_thinking to spawn_agent backend=cursor; use cursor_model instead.",
 			"After spawn_agent, use wait_agent or wait_all_agents when the delegated result must block the current workflow; never sleep or poll.",
@@ -1510,6 +1475,21 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		renderResult(result: any, _options: any, theme: any) { return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ spawn failed" : `✓ ${result.details?.agent_name ?? "spawned"}`), 0, 0); },
 	};
 	pi.registerTool(spawnTool);
+
+	pi.registerTool({
+		name: "list_agent_templates",
+		label: "List Agent Templates",
+		description: "List effective global and trusted project-local agent templates. Prompt bodies are never returned. Project templates require both Pi project trust and the package trustedProjects canonical-root allowlist.",
+		promptSnippet: "List effective trusted subagent templates without exposing their prompts.",
+		promptGuidelines: ["Use list_agent_templates before selecting agent_type; use the returned lowercase name exactly."],
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _update, ctx) {
+			const catalog = publicAgentTemplateCatalog(manager.templateCatalog(ctx));
+			return textResult(JSON.stringify(catalog, null, 2), catalog);
+		},
+		renderCall(_args, theme) { return new Text(theme.fg("toolTitle", theme.bold("list_agent_templates")), 0, 0); },
+		renderResult(result: any, _options, theme) { return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ template listing failed" : `✓ ${result.details?.templates?.length ?? 0} templates`), 0, 0); },
+	});
 
 	pi.registerTool({
 		name: "list_subagent_models",

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { registerUnifiedSubagents } from "../extensions/unified.ts";
 import type {
@@ -28,11 +28,12 @@ function fakeApi() {
 	} as any;
 }
 
-function context(sessionId: string, cwd: string) {
+function context(sessionId: string, cwd: string, projectTrusted = false) {
 	return {
 		cwd, mode: "json", model: { provider: "test", id: "model" }, modelRegistry: { find: () => ({}) },
 		sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(cwd, `${sessionId}.jsonl`) },
 		ui: { setWidget() {}, notify() {} },
+		isProjectTrusted: () => projectTrusted,
 	};
 }
 
@@ -136,6 +137,43 @@ async function execute(api: ReturnType<typeof fakeApi>, name: string, params: un
 }
 
 async function turn() { await new Promise<void>((resolve) => setImmediate(resolve)); }
+
+test("registered template catalog is trust-gated, prompt-safe, project-preferred, and hot-read by spawn", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-templates-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver;
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; }));
+	const globalDir = join(root, "agents"); const projectDir = join(root, ".pi", "pi-bstn-subagents", "agents"); await mkdir(globalDir, { recursive: true }); await mkdir(projectDir, { recursive: true });
+	await writeFile(join(globalDir, "reviewer.md"), "---\nname: reviewer\nbackend: pi\ndescription: global\n---\nglobal private prompt\n");
+	await writeFile(join(projectDir, "reviewer.md"), "---\nname: reviewer\nbackend: pi\ndescription: project one\n---\nproject private one\n");
+	await writeFile(join(root, "config.json"), JSON.stringify({ trustedProjects: [root] }));
+	const blocked = await execute(api, "list_agent_templates", {}, context("blocked", root, false)); assert.equal(blocked.details.templates[0].scope, "global"); assert.equal(blocked.details.project_status, "blocked-pi-trust");
+	const trusted = context("trusted", root, true); const listed = await execute(api, "list_agent_templates", {}, trusted); assert.equal(listed.details.templates[0].scope, "project"); assert.equal(listed.details.templates[0].shadows_global, true); assert.doesNotMatch(listed.content[0].text, /private one|global private/);
+	try {
+		await execute(api, "spawn_agent", { task_name: "one", message: "task one", backend: "pi", agent_type: "reviewer" }, trusted); await turn(); assert.equal(runtimes.pi.get("/one")?.message, "project private one\n\ntask one");
+		await writeFile(join(projectDir, "reviewer.md"), "---\nname: reviewer\nbackend: pi\ndescription: project two\n---\nproject private two\n");
+		await execute(api, "spawn_agent", { task_name: "two", message: "task two", backend: "pi", agent_type: "reviewer" }, trusted); await turn(); assert.equal(runtimes.pi.get("/two")?.message, "project private two\n\ntask two");
+		await mkdir(join(root, "nested")); await execute(api, "spawn_agent", { task_name: "nested", message: "task nested", backend: "pi", agent_type: "reviewer", cwd: "nested" }, trusted); await turn(); assert.equal(runtimes.pi.get("/nested")?.message, "project private two\n\ntask nested");
+	} finally { await observer.shutdown(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("project skills require both trust gates and global templates cannot bind same-named project resources", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-template-resources-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver; const projections: ProjectionCapture = { pi: [], herdr: [] };
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; }, { projections }));
+	const projectTemplates = join(root, ".pi", "pi-bstn-subagents", "agents"); const projectSkill = join(root, ".pi", "skills", "local"); await mkdir(projectTemplates, { recursive: true }); await mkdir(projectSkill, { recursive: true }); await mkdir(join(root, "agents"), { recursive: true });
+	await writeFile(join(projectSkill, "SKILL.md"), "# trusted local skill\n"); await writeFile(join(root, "config.json"), JSON.stringify({ trustedProjects: [root] }));
+	await writeFile(join(root, "agents", "global-local.md"), "---\nname: global-local\nbackend: pi\nskills: local\n---\nglobal\n");
+	await writeFile(join(projectTemplates, "project-local.md"), "---\nname: project-local\nbackend: pi\nskills: local\n---\nproject\n");
+	const outsideSkill = join(resolve(root, ".."), `outside-skill-${Date.now()}`); await mkdir(outsideSkill); await writeFile(join(outsideSkill, "SKILL.md"), "# outside\n"); await symlink(outsideSkill, join(root, ".pi", "skills", "escape"));
+	await writeFile(join(projectTemplates, "escape.md"), "---\nname: escape\nbackend: pi\nskills: escape\n---\nescape\n");
+	await writeFile(join(projectTemplates, "traversal.md"), "---\nname: traversal\nbackend: pi\nskills: ../../outside\n---\ntraversal\n");
+	try {
+		await assert.rejects(() => execute(api, "spawn_agent", { task_name: "blocked", message: "x", backend: "pi", agent_type: "project-local" }, context("blocked-resource", root, false)), /not found/);
+		await assert.rejects(() => execute(api, "spawn_agent", { task_name: "global", message: "x", backend: "pi", agent_type: "global-local" }, context("trusted-resource", root, true)), /Skill not found/);
+		await assert.rejects(() => execute(api, "spawn_agent", { task_name: "escape", message: "x", backend: "pi", agent_type: "escape" }, context("trusted-resource", root, true)), /Skill not found/);
+		await assert.rejects(() => execute(api, "spawn_agent", { task_name: "traversal", message: "x", backend: "pi", agent_type: "traversal" }, context("trusted-resource", root, true)), /Skill path not found/);
+		await execute(api, "spawn_agent", { task_name: "project", message: "x", backend: "pi", agent_type: "project-local" }, context("trusted-resource", root, true)); await turn();
+		assert.deepEqual(projections.pi.at(-1)?.skillPaths, [await realpath(projectSkill)]);
+	} finally { await observer.shutdown(); await rm(root, { recursive: true, force: true }); await rm(outsideSkill, { recursive: true, force: true }); }
+});
 
 test("registered tools remain detached, isolated, serialized, and observable through the narrow test observer", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-unified-foundation-"));

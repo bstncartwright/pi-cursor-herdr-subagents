@@ -34,6 +34,7 @@ Run `/reload` after changing the installed package.
 | Tool | Purpose |
 |---|---|
 | `list_subagent_models` | Discover exact backend-specific model and thinking parameters with filtering and pagination |
+| `list_agent_templates` | List effective global and trusted project-local templates without exposing prompt bodies |
 | `spawn_agent` | Spawn a fresh-context Pi or Cursor ACP agent; `backend` is required and Pi model/thinking overrides are optional |
 | `wait_agent` | Wait for one completion or Cursor permission request |
 | `wait_all_agents` | Wait for all selected agents; returns early for a permission request |
@@ -204,6 +205,7 @@ Optional `config.json`:
 ```json
 {
   "storageDir": "~/tmp/pi-agent-runs",
+  "trustedProjects": ["/absolute/canonical/path/to/project"],
   "defaults": {
     "skills": ["web-investigate"],
     "extensions": ["@scope/pi-extra-tools"]
@@ -215,7 +217,7 @@ Relative storage paths resolve from `~/.pi/agent/pi-bstn-subagents/`.
 
 ## Agent templates
 
-Templates live in `~/.pi/agent/pi-bstn-subagents/agents/*.md`.
+Global templates live in `~/.pi/agent/pi-bstn-subagents/agents/*.md`. Project-local templates live in `<project>/.pi/pi-bstn-subagents/agents/*.md` and are loaded only when both `ctx.isProjectTrusted()` and the global package `trustedProjects` allowlist approve the canonical `ctx.cwd`. This second gate is intentional: older Pi versions can report a project trusted when it contains only package-specific resources that Pi itself does not recognize as trust-requiring.
 
 Pi template:
 
@@ -250,7 +252,9 @@ permission_mode: agent
 Review the requested code and prioritize correctness defects.
 ```
 
-The explicit `backend` passed to `spawn_agent` must agree with the template. Pi templates may set provider/model, thinking, tools, skills, and installed extensions. Explicit `pi_model` and `pi_thinking` override those template values independently; otherwise the template overrides parent inheritance. A selected template that specifies either `provider` or `model` must provide a complete nonempty pair unless an explicit `pi_model` overrides it. Automatic child extension, skill, and prompt-template discovery is disabled.
+Use `list_agent_templates` before selecting `agent_type`. Template names must match `^[a-z][a-z0-9_-]{0,63}$`. The catalog is rebuilt for each listing and spawn, so edits need no watcher or `/reload`. A trusted project template overrides a global template with the same name. Duplicate or case-colliding names within one scope fail closed; a conflicted project name never falls back to a global definition. Symlinked directories/files, non-regular files, and templates larger than 64 KiB are rejected. Catalog results include only safe metadata and diagnostics—not prompt bodies.
+
+The explicit `backend` passed to `spawn_agent` must agree with the template. Pi templates may set provider/model, thinking, tools, skills, and installed extensions. Explicit `pi_model` and `pi_thinking` override those template values independently; otherwise the template overrides parent inheritance. A selected template that specifies either `provider` or `model` must provide a complete nonempty pair unless an explicit `pi_model` overrides it. Project templates may run only inside their canonical trusted project root. Named resources from global templates/defaults resolve globally; project resource lookup is enabled only for package-approved trusted projects. Automatic child extension, skill, and prompt-template discovery is disabled.
 
 ## UI and Herdr
 
@@ -272,7 +276,7 @@ This package and every child agent run with your full system permissions. There 
 
 - Pi children load only explicitly selected skills/extensions, but their tools can still mutate the working tree.
 - Cursor ACP permission handling does not sandbox approved operations.
-- Raw `.events.log` files retain their existing forensic behavior and can contain prompts, thoughts, output, and paths. The Pi overlay continues reading them unchanged.
+- Raw `.events.log` files retain their existing forensic behavior and can contain prompts, thoughts, output, and paths. The native overlay reads them only after explicit double confirmation and never stores them in semantic overlay state.
 - The private `.viewer.jsonl` journal is created mode `0600`. It stores versioned, bounded, terminal-safe/redacted semantic summaries only: never raw thought chunks, raw command text, tool arguments, or tool output. Thought entries retain only a generic/heading preview plus counts. Tool commands use a small semantic allowlist (for example `npm test`); otherwise only a program label and character count are stored. Tool updates retain status/counts, and outcomes retain allowlisted structural metadata or opaque character counts. Raw details remain solely in the legacy log.
 - Cursor ACP fidelity is limited to fields the protocol explicitly supplies. Title-only tool updates are observed but are not correlated into a fabricated lifecycle; Cursor's current ACP limitations (notably no resume/close) still apply.
 - Cursor model changes temporarily touch `~/.cursor/cli-config.json`; the package restores and verifies the previous content.
