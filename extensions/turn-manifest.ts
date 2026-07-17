@@ -588,11 +588,30 @@ export function migrateLegacyInfo(parentSessionId: string, epoch: string, infos:
 	for (const info of infos) {
 		if (info.parentSessionId !== parentSessionId) fail(`legacy agent ${info.id} belongs to another parent`);
 		const legacyClosed = info.status === "closed";
+		// Early unified records accidentally copied parent Pi configuration onto Cursor
+		// agents. Migration is the trust boundary: retain only fields the selected backend
+		// could actually have resolved, rather than making old compatibility debris canonical.
+		const isPi = info.backend === "pi";
+		const cursorModel = isPi ? undefined : info.cursorModel ?? info.model;
+		const skills = isPi ? info.skills ?? [] : [];
+		const skillPaths = isPi ? info.skillPaths ?? [] : [];
+		const extensions = isPi ? info.extensions ?? [] : [];
+		const extensionPaths = isPi ? info.extensionPaths ?? [] : [];
 		manifest = addAgent(manifest, {
-			id: info.id, taskName: info.taskName, canonicalName: info.canonicalName, backend: info.backend, parentSessionId, parentSessionFile: info.parentSessionFile, agentType: info.agentType, cwd: info.cwd, model: info.model, provider: info.provider, modelId: info.modelId, thinking: info.thinking, tools: info.tools, skills: info.skills ?? [], skillPaths: info.skillPaths ?? [], extensions: info.extensions ?? [], extensionPaths: info.extensionPaths ?? [], cursorModel: info.cursorModel, permissionMode: legacyPermissionMode(info.permissionMode), acpSessionId: info.backend === "cursor" ? info.acpSessionId : undefined, acpCapabilities: info.backend === "cursor" ? legacyCapabilities(info.acpCapabilities) : undefined, sessionFile: info.sessionFile, infoFile: info.infoFile, logFile: info.logFile, responseFile: info.responseFile, viewerPaneId: info.viewerPaneId, viewerTabId: info.viewerTabId, createdAt: info.createdAt, updatedAt: info.updatedAt,
+			id: info.id, taskName: info.taskName, canonicalName: info.canonicalName, backend: info.backend, parentSessionId, parentSessionFile: info.parentSessionFile, agentType: info.agentType, cwd: info.cwd,
+			model: isPi ? info.model : cursorModel!, provider: isPi ? info.provider : undefined, modelId: isPi ? info.modelId : undefined,
+			thinking: isPi ? info.thinking : undefined, tools: isPi ? info.tools : undefined, skills, skillPaths, extensions, extensionPaths,
+			cursorModel, permissionMode: legacyPermissionMode(info.permissionMode), acpSessionId: isPi ? undefined : info.acpSessionId,
+			acpCapabilities: isPi ? undefined : legacyCapabilities(info.acpCapabilities), sessionFile: isPi ? info.sessionFile : undefined,
+			infoFile: info.infoFile, logFile: info.logFile, responseFile: info.responseFile, viewerPaneId: info.viewerPaneId, viewerTabId: info.viewerTabId, createdAt: info.createdAt, updatedAt: info.updatedAt,
 		}, now);
 		const terminal: TerminalStatus = info.status === "completed" ? "completed" : info.status === "failed" ? "failed" : info.status === "paused" ? "paused" : "interrupted";
-		const execution: ResolvedExecutionSnapshot = { backend: info.backend, cwd: info.cwd, model: info.model, provider: info.provider, modelId: info.modelId, thinking: info.thinking, tools: info.tools, skills: info.skills ?? [], skillPaths: info.skillPaths ?? [], extensions: info.extensions ?? [], extensionPaths: info.extensionPaths ?? [], cursorModel: info.cursorModel, permissionMode: legacyPermissionMode(info.permissionMode), sessionFile: info.sessionFile, prompt: "", displayMessage: info.lastTaskMessage ?? "" };
+		const execution: ResolvedExecutionSnapshot = {
+			backend: info.backend, cwd: info.cwd, model: isPi ? info.model : cursorModel!, provider: isPi ? info.provider : undefined,
+			modelId: isPi ? info.modelId : undefined, thinking: isPi ? info.thinking : undefined, tools: isPi ? info.tools : undefined,
+			skills, skillPaths, extensions, extensionPaths, cursorModel, permissionMode: legacyPermissionMode(info.permissionMode),
+			sessionFile: isPi ? info.sessionFile : undefined, prompt: "", displayMessage: info.lastTaskMessage ?? "",
+		};
 		const turnId = `legacy-${info.id}`;
 		manifest = enqueueTurn(manifest, { id: turnId, agentId: info.id, source: "initial", execution, createdAt: now, ownerEpoch: epoch });
 		const completion = info.completedAt ?? info.updatedAt ?? now;

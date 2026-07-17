@@ -150,7 +150,13 @@ test("legacy info-only migration preserves settled records and interrupts old ac
 	const manifest = migrateLegacyInfo(parent, "epoch-b", [
 		{ ...agent("legacy-running"), permissionMode: undefined, status: "running", turn: 1, lastActivity: now, startedAt: now, error: undefined },
 		{ ...agent("legacy-complete"), status: "completed", turn: 2, lastActivity: now, completedAt: now, finalResponse: "do not persist this" },
-		{ ...agent("legacy-paused", "cursor"), status: "paused", turn: 3, lastActivity: now, acpCapabilities: { loadSession: true, unsafe: "discard" } },
+		{
+			...agent("legacy-paused", "cursor"), status: "paused", turn: 3, lastActivity: now,
+			// Old Cursor projections inherited these parent-Pi fields before the backend split.
+			provider: "stale-provider", modelId: "stale-model", thinking: "high", tools: "bash",
+			skills: ["stale-skill"], skillPaths: ["/stale/skill"], extensions: ["stale-extension"], extensionPaths: ["/stale/extension"],
+			acpCapabilities: { loadSession: true, unsafe: "discard" },
+		},
 		{ ...agent("legacy-closed"), status: "closed", turn: 4, lastActivity: now, closedAt: now },
 	], now + 1);
 	assert.equal(manifest.turns["legacy-legacy-running"]!.terminalStatus, "interrupted");
@@ -159,6 +165,9 @@ test("legacy info-only migration preserves settled records and interrupts old ac
 	assert.equal(manifest.turns["legacy-legacy-complete"]!.terminalStatus, "completed");
 	assert.equal(manifest.turns["legacy-legacy-paused"]!.terminalStatus, "paused");
 	assert.deepEqual(manifest.agents["legacy-paused"]!.acpCapabilities, { loadSession: true });
+	assert.equal(manifest.agents["legacy-paused"]!.provider, undefined);
+	assert.equal(manifest.agents["legacy-paused"]!.thinking, undefined);
+	assert.deepEqual(manifest.agents["legacy-paused"]!.skills, []);
 	assert.equal(manifest.agents["legacy-closed"]!.closed, true);
 	assert.equal(manifest.turns["legacy-legacy-closed"]!.terminalStatus, "interrupted");
 	assert.equal(manifest.turns["legacy-legacy-complete"]!.ordinal, 2);
