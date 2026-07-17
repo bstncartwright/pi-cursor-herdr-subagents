@@ -313,6 +313,7 @@ test("settled subagents auto-close after fifteen idle minutes", async () => {
 test("response deltas stay out of the journal until one finalized response", async () => {
 	const { readFile } = await import("node:fs/promises");
 	const source = await readFile(new URL("../extensions/unified.ts", import.meta.url), "utf8");
+	const piRuntime = await readFile(new URL("../extensions/pi-runtime.ts", import.meta.url), "utf8");
 	const piHandler = source.slice(source.indexOf("private handlePiEvent"), source.indexOf("private handleCursorNotification"));
 	const cursorHandler = source.slice(source.indexOf("private handleCursorNotification"), source.indexOf("private async handleCursorRequest"));
 	const finalize = source.slice(source.indexOf("private finalize"), source.indexOf("private completionEvent"));
@@ -320,9 +321,9 @@ test("response deltas stay out of the journal until one finalized response", asy
 	assert.doesNotMatch(cursorHandler, /kind: "response"/);
 	assert.match(piHandler, /live\.currentOutput \+= event\.text;[\s\S]*this\.setPhase\(live, "Writing response"\);[\s\S]*log\(live\.info, "assistant", event\.text\)/);
 	assert.match(cursorHandler, /live\.currentOutput \+= text;[\s\S]*this\.setPhase\(live, "Writing response"\);[\s\S]*log\(live\.info, "assistant", text\)/);
-	assert.match(source, /this\.candidateResponse = messageText\(event\.message\);/);
-	assert.match(source, /this\.candidateResponse = messageText\(assistant\);/);
-	assert.doesNotMatch(source, /this\.candidateResponse = messageText\([^)]*\)\.trim\(\);/);
+	assert.match(piRuntime, /this\.candidateResponse = messageText\(event\.message\);/);
+	assert.match(piRuntime, /this\.candidateResponse = messageText\(assistant\);/);
+	assert.doesNotMatch(piRuntime, /this\.candidateResponse = messageText\([^)]*\)\.trim\(\);/);
 	const responseAppend = 'this.appendLedger(live.info, { kind: "response", text: live.info.finalResponse });';
 	assert.equal(finalize.split(responseAppend).length - 1, 1);
 	assert.ok(finalize.indexOf(responseAppend) < finalize.indexOf('this.appendLedger(live.info, { kind: "runtime", state: status })'));
