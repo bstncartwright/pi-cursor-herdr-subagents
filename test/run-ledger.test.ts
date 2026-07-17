@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	MAX_SERIALIZED_SUMMARY_LENGTH,
+	buildRunLedgerPresentation,
 	normalizeRunLedgerEvent,
 	parseRunLedgerJsonl,
 	createRunLedgerState,
@@ -150,6 +151,21 @@ test("tool correlation is composite turn+ID, supports reuse/late updates, and ig
 	assert.equal(state.tools.get(toolLedgerKey(2, "same"))?.errorPreview, "boom");
 	assert.equal(state.tools.get(toolLedgerKey(2, "same"))?.resultPreview, undefined);
 	assert.equal(state.unknownToolEvents, 2);
+});
+
+test("presentation blocks retain stable keys across lifecycle updates", () => {
+	const start = event("tool-start", { id: "same", name: "read", inputSummary: "read · a.ts" }, 1, at, 1);
+	const update = event("tool-update", { id: "same", status: "running", count: 2 }, 2, at + 1, 1);
+	const first = reduceRunLedgerEvents([start]); const second = reduceRunLedgerEvents([start, update]);
+	assert.equal(buildRunLedgerPresentation(first, { width: 80 }).blocks[0]!.key, buildRunLedgerPresentation(second, { width: 80 }).blocks[0]!.key);
+	assert.match(renderRunLedgerText(renderRunLedger(second, { width: 80, height: 3 })), /updates 2/);
+});
+
+test("presentation block keys survive a bounded-tail head drop", () => {
+	const phases = [1, 2, 3].map((seq) => event("phase", { name: `phase ${seq}` }, seq, at + seq, 1));
+	const full = buildRunLedgerPresentation(reduceRunLedgerEvents(phases), { width: 80 }).blocks.map((block) => block.key);
+	const tail = buildRunLedgerPresentation(reduceRunLedgerEvents(phases.slice(1)), { width: 80 }).blocks.map((block) => block.key);
+	assert.deepEqual(full.slice(1), tail);
 });
 
 

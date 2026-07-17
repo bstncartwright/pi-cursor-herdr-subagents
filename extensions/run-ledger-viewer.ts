@@ -29,12 +29,12 @@ export interface ViewerFrameOptions extends RunLedgerViewerPaths {
 	now?: number;
 }
 
-const JOURNAL_TAIL_BYTES = 256 * 1024;
-const JOURNAL_TAIL_LINES = 800;
-const RAW_TAIL_BYTES = 24 * 1024;
-const RAW_TAIL_LINES = 80;
+export const JOURNAL_TAIL_BYTES = 256 * 1024;
+export const JOURNAL_TAIL_LINES = 800;
+export const RAW_TAIL_BYTES = 24 * 1024;
+export const RAW_TAIL_LINES = 80;
 
-function boundedTail(path: string, maxBytes: number): string {
+export function readBoundedTail(path: string, maxBytes: number): string {
 	try {
 		const size = statSync(path).size;
 		const length = Math.max(0, Math.min(size, maxBytes));
@@ -106,7 +106,7 @@ function fit(value: string, width: number): string {
 
 /** Sanitized, bounded compatibility view for old raw .events.log files. */
 export function renderLegacyRunLog(rawLogPath: string, width: number, height: number, reason?: string): string {
-	const raw = boundedTail(rawLogPath, RAW_TAIL_BYTES);
+	const raw = readBoundedTail(rawLogPath, RAW_TAIL_BYTES);
 	const lines = raw.replace(/\r/g, "").split("\n")
 		.map((line) => sanitizeTerminalText(line, Math.max(1, width)))
 		.filter(Boolean)
@@ -120,7 +120,7 @@ interface ViewerPresentation { plain: string; frame?: RunLedgerFrame; }
 function viewerPresentation(options: ViewerFrameOptions): ViewerPresentation {
 	const width = Math.max(1, Math.floor(options.width) || 1);
 	const height = Math.max(1, Math.floor(options.height) || 1);
-	const journal = boundedTail(options.journalPath, JOURNAL_TAIL_BYTES);
+	const journal = readBoundedTail(options.journalPath, JOURNAL_TAIL_BYTES);
 	const parsed = parseRunLedgerJsonl(journal, { maxBytes: JOURNAL_TAIL_BYTES, maxLines: JOURNAL_TAIL_LINES });
 	if (!parsed.events.length) {
 		const reason = !existsSync(options.journalPath) ? "journal unavailable" : parsed.malformed || parsed.unsupported ? "journal unavailable" : "waiting for ledger";

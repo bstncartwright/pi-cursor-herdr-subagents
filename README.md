@@ -254,10 +254,13 @@ The explicit `backend` passed to `spawn_agent` must agree with the template. Pi 
 
 ## UI and Herdr
 
-Every newly created backend gets a background Herdr **Run Ledger** viewer tab. These tabs are viewers only and are not registered as Herdr agents. The built-in viewer follows the private semantic journal with a compact identity/status/task header, thought previews, response chunks, tool lifecycle and permission/error/completion state. It falls back safely to the legacy raw event log when a journal is absent, partial, or unusable. Existing tabs and the Pi overlay remain raw-log based in this phase; no overlay controls or behavior changed. Pi Run Ledger entries also show authoritative cumulative session usage, Pi's reported current-context estimate, and absolute compaction count. Cursor usage/context/compaction are deliberately shown as `—`, never estimated.
+Every newly created backend gets a background Herdr **Run Ledger** viewer tab. These tabs are viewers only and are not registered as Herdr agents. The built-in viewer follows the private semantic journal with a compact identity/status/task header, thought previews, response chunks, tool lifecycle and permission/error/completion state. It falls back safely to the legacy raw event log when a journal is absent, partial, or unusable. Pi Run Ledger entries also show authoritative cumulative session usage, Pi's reported current-context estimate, and absolute compaction count. Cursor usage/context/compaction are deliberately shown as `—`, never estimated.
 
-- `/agents` browses current-session agents; press Tab for read-only history. Each agent has a live activity subline that switches to a compact final-response summary after settlement.
-- `/subagent <task-name>` opens one current-session agent.
+- `/agents` browses current-session agents; press Tab for read-only history. Each agent has a live activity subline that switches to a compact final-response summary after settlement. Enter opens the native semantic Run Ledger.
+- `/subagent <task-name>` opens one current-session Run Ledger directly.
+- Inside the native ledger, use `j/k`, arrows, page keys, or `g/G` to inspect semantic blocks; detached views count new blocks until `G` resumes follow mode. Left/Right changes agents.
+- Enter composes a Pi steering message, a Cursor replacement correction, or a settled follow-up according to the visible state. `x` twice interrupts active work. Historical records are read-only.
+- Raw diagnostics are never the native default. Press `r` twice to acknowledge that raw logs may contain prompts, reasoning, commands, output, paths, and secrets; press `r` again to return to the semantic ledger.
 - The persistent editor widget uses the same two-line format and elapsed runtime, retaining the `[pi]`/`[cursor]` backend prefix. Pi metadata shows `model · thinking <level> · status · elapsed` (or `thinking unknown` for legacy records); Cursor metadata omits thinking. Activity phases include `Thinking`, `Writing response`, `Tool · bash`, and `Awaiting approval`.
 - In the overlay: Left/Right changes agents, `j`/`k` scrolls, `g`/`G` jumps, and `q` closes.
 

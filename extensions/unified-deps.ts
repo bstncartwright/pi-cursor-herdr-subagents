@@ -77,7 +77,8 @@ export interface AgentStateSnapshot {
 	status: "queued" | "starting" | "running" | "completed" | "failed" | "interrupted" | "paused" | "closed";
 	createdAt: number; updatedAt: number; startedAt?: number; completedAt?: number; closedAt?: number; lastActivityAt: number;
 	/** Sanitized runtime phase/tool metadata only. */ activity: string | null;
-	turnId?: string; turnSequence?: number; terminalReason?: string; queuePosition?: number; permissionPending: boolean;
+	turnId?: string; turnSequence?: number; turnOrdinal?: number; terminalReason?: string; queuePosition?: number; permissionPending: boolean;
+	/** In-memory semantic journal revision; never canonical lifecycle state. */ ledgerRevision: number;
 	/** Pi only; Cursor intentionally has no estimates. */ metrics?: AgentMetricsSnapshot;
 }
 export interface ManagerStateSnapshot {

@@ -161,8 +161,10 @@ test("registered tools remain detached, isolated, serialized, and observable thr
 		assert.equal(projectedList.details.agents[0].agent_name, "/alpha", "projection mutation cannot alter persisted agent metadata");
 		const waiting = execute(api, "wait_agent", { targets: ["alpha"] }, parentA);
 		let pending = true; void waiting.finally(() => { pending = false; }); await turn(); assert.equal(pending, true);
+		const revisionBefore = (snapshots.at(-1) as any).agents.find((agent: any) => agent.agentName === "/alpha").ledgerRevision;
 		runtimes.emitPi("/alpha", { type: "phase", phase: "Reading plan" });
 		assert.match(JSON.stringify(snapshots), /Reading plan/);
+		assert.ok((snapshots.at(-1) as any).agents.find((agent: any) => agent.agentName === "/alpha").ledgerRevision > revisionBefore);
 		runtimes.settlePi("/alpha");
 		const waited = await waiting;
 		const waitedPayload = JSON.parse(waited.content[0].text);

@@ -546,10 +546,10 @@ export function parseRunLedgerJsonl(input: string, options: ParseRunLedgerOption
 
 export const parseLedgerJsonl = parseRunLedgerJsonl;
 
-export interface ThoughtRow { kind: "thought"; ts: number; turn: number; preview: string; chunks: number; characters: number; }
-export interface ResponseRow { kind: "response"; ts: number; turn: number; text: string; chunks: number; characters: number; }
-export interface PhaseRow { kind: "phase"; ts: number; turn: number; name: string; detail?: string; }
-export interface ToolRow { kind: "tool"; ts: number; turn: number; id: string; name: string; /** Immutable start context, never replaced by update/output text. */ inputSummary?: string; summary?: string; updateSummary?: string; status: string; resultPreview?: string; errorPreview?: string; endedAt?: number; durationMs?: number; }
+export interface ThoughtRow { kind: "thought"; seq: number; ts: number; turn: number; preview: string; chunks: number; characters: number; }
+export interface ResponseRow { kind: "response"; seq: number; ts: number; turn: number; text: string; chunks: number; characters: number; }
+export interface PhaseRow { kind: "phase"; seq: number; ts: number; turn: number; name: string; detail?: string; }
+export interface ToolRow { kind: "tool"; seq: number; ts: number; turn: number; id: string; name: string; /** Immutable start context, never replaced by update/output text. */ inputSummary?: string; summary?: string; updateSummary?: string; status: string; resultPreview?: string; errorPreview?: string; endedAt?: number; durationMs?: number; }
 export type LedgerTimelineRow = ThoughtRow | ResponseRow | PhaseRow | ToolRow;
 export interface PinnedPermission { ts: number; turn: number; status: string; summary: string; }
 export interface PinnedError { ts: number; turn: number; message: string; code?: string; }
@@ -628,26 +628,26 @@ export function reduceRunLedger(state: RunLedgerState, event: RunLedgerEvent): R
 		case "run": return { ...base, runId: event.runId, title: event.title, startedAt: state.startedAt ?? event.createdAt ?? event.ts };
 		case "runtime": return { ...base, runtimeState: event.state, runtimeDetail: event.detail };
 		case "task": return { ...base, task: event.synopsis };
-		case "phase": timeline.push({ kind: "phase", ts: event.ts, turn: event.turn, name: event.name, detail: event.detail }); return base;
+		case "phase": timeline.push({ kind: "phase", seq: event.seq, ts: event.ts, turn: event.turn, name: event.name, detail: event.detail }); return base;
 		case "thought": {
 			const preview = truncate(redactTextSecrets(event.preview), MAX_THOUGHT_PREVIEW_LENGTH) || "Working through details";
 			const previous = timeline.at(-1);
 			if (previous?.kind === "thought" && previous.turn === event.turn) {
 				timeline[timeline.length - 1] = { ...previous, chunks: previous.chunks + (event.chunks ?? 1), characters: previous.characters + (event.characters ?? codePointLength(event.preview)) };
-			} else timeline.push({ kind: "thought", ts: event.ts, turn: event.turn, preview, chunks: event.chunks ?? 1, characters: event.characters ?? codePointLength(event.preview) });
+			} else timeline.push({ kind: "thought", seq: event.seq, ts: event.ts, turn: event.turn, preview, chunks: event.chunks ?? 1, characters: event.characters ?? codePointLength(event.preview) });
 			return base;
 		}
 		case "response": {
 			const previous = timeline.at(-1);
 			if (previous?.kind === "response" && previous.turn === event.turn) {
 				timeline[timeline.length - 1] = { ...previous, text: truncate(`${previous.text}${event.text}`, MAX_RESPONSE_STATE_LENGTH), chunks: previous.chunks + 1, characters: previous.characters + codePointLength(event.text) };
-			} else timeline.push({ kind: "response", ts: event.ts, turn: event.turn, text: truncate(event.text, MAX_RESPONSE_STATE_LENGTH), chunks: 1, characters: codePointLength(event.text) });
+			} else timeline.push({ kind: "response", seq: event.seq, ts: event.ts, turn: event.turn, text: truncate(event.text, MAX_RESPONSE_STATE_LENGTH), chunks: 1, characters: codePointLength(event.text) });
 			return base;
 		}
 		case "tool-start": {
 			const key = toolLedgerKey(event.turn, event.id);
 			if (tools.has(key)) return { ...base, unknownToolEvents: state.unknownToolEvents + 1 };
-			const row: ToolRow = { kind: "tool", ts: event.ts, turn: event.turn, id: event.id, name: event.name, inputSummary: event.inputSummary, summary: event.inputSummary, status: "running" };
+			const row: ToolRow = { kind: "tool", seq: event.seq, ts: event.ts, turn: event.turn, id: event.id, name: event.name, inputSummary: event.inputSummary, summary: event.inputSummary, status: "running" };
 			tools.set(key, row); timeline.push(row); return base;
 		}
 		case "tool-update": {
@@ -682,6 +682,8 @@ export interface RunLedgerToken { role: RunLedgerRole; text: string; }
 export interface RunLedgerLine { tokens: RunLedgerToken[]; }
 export interface RunLedgerFrame { lines: RunLedgerLine[]; width: number; height: number; }
 export interface RenderRunLedgerOptions { width: number; height: number; now?: number; }
+export interface RunLedgerPresentationBlock { key: string; lines: RunLedgerLine[]; }
+export interface RunLedgerPresentation { sticky: RunLedgerLine[]; blocks: RunLedgerPresentationBlock[]; footer?: RunLedgerLine; }
 export const MAX_RESPONSE_RENDER_LINES = 3;
 
 function line(...tokens: RunLedgerToken[]): RunLedgerLine { return { tokens: tokens.filter((token) => token.text).map((token) => ({ ...token })) }; }
@@ -744,9 +746,9 @@ function timelineLines(row: LedgerTimelineRow, width: number, startedAt: number)
 	return [line({ role: "timestamp", text: time }, { role: "tool", text: fit(`Tool · ${lifecycle}`, width - codePointLength(time)) })];
 }
 
-/** Render semantic tokens only; callers apply their own theme/ANSI overlay. */
-export function renderRunLedger(state: RunLedgerState, options: RenderRunLedgerOptions): RunLedgerFrame {
-	const width = Math.max(1, Math.floor(options.width)); const height = Math.max(1, Math.floor(options.height));
+/** Build stable semantic blocks for tail rendering and native block-wise scrolling. */
+export function buildRunLedgerPresentation(state: RunLedgerState, options: { width: number; now?: number }): RunLedgerPresentation {
+	const width = Math.max(1, Math.floor(options.width));
 	const requestedNow = options.now ?? state.lastTs ?? 0;
 	const terminalRuntime = /^(?:completed|failed|interrupted|closed|cancelled|canceled)$/i.test(state.runtimeState ?? "");
 	const elapsedAt = state.completion?.ts ?? (terminalRuntime ? state.lastTs ?? requestedNow : requestedNow);
@@ -759,7 +761,6 @@ export function renderRunLedger(state: RunLedgerState, options: RenderRunLedgerO
 			? fitLine(width, { role: "identity", text: `RUN ${fit(identity, 24)}` }, { role: "muted", text: " · " }, { role: "state", text: status }, { role: "muted", text: " · " }, { role: "elapsed", text: elapsed }, { role: "muted", text: " · T" }, { role: "turn", text: String(state.turn) })
 			: fitLine(width, { role: "identity", text: fit(identity, Math.max(1, width - 22)) }, { role: "muted", text: " · " }, { role: "state", text: status }, { role: "muted", text: " · " }, { role: "elapsed", text: elapsed }, { role: "muted", text: " · T" }, { role: "turn", text: String(state.turn) });
 	const footer = state.completion ? line({ role: "completion", text: fit(`Completed · ${state.completion.status}${state.completion.summary ? ` · ${state.completion.summary}` : ""}`, width) }) : undefined;
-	if (height === 1 && footer) return { lines: [footer], width, height };
 	const fixed: RunLedgerLine[] = [header];
 	if (state.permission) fixed.push(line({ role: "warning", text: fit(`Permission · ${state.permission.status} · ${state.permission.summary}`, width) }));
 	if (state.error) fixed.push(line({ role: "error", text: fit(`Error${state.error.code ? ` ${state.error.code}` : ""} · ${state.error.message}`, width) }));
@@ -772,14 +773,22 @@ export function renderRunLedger(state: RunLedgerState, options: RenderRunLedgerO
 	const compaction = state.backend === "cursor" || !state.compaction ? undefined : `compact ${state.compaction.state}${state.compaction.willRetry ? " · retry" : ""}`;
 	const metadata = [state.backend, state.model, state.thinking ? `thinking ${state.thinking}` : undefined, usage, compaction, state.cwd].filter((value): value is string => !!value).join(" · ");
 	if (metadata) fixed.push(line({ role: "muted", text: fit(metadata, width) }));
+	const blocks = state.timeline.map((row) => ({ key: row.kind === "tool" ? `tool:${row.turn}:${row.id}` : `${row.kind}:${row.turn}:${row.seq}`, lines: timelineLines(row, width, state.startedAt ?? row.ts) }));
+	return { sticky: fixed, blocks, footer };
+}
+
+/** Render semantic tokens only; callers apply their own theme/ANSI overlay. */
+export function renderRunLedger(state: RunLedgerState, options: RenderRunLedgerOptions): RunLedgerFrame {
+	const width = Math.max(1, Math.floor(options.width)); const height = Math.max(1, Math.floor(options.height));
+	const { sticky: fixed, blocks, footer } = buildRunLedgerPresentation(state, { width, now: options.now });
+	if (height === 1 && footer) return { lines: [footer], width, height };
 	const reserveFooter = footer ? 1 : 0; const fixedVisible = fixed.slice(0, Math.max(0, height - reserveFooter));
 	const remaining = Math.max(0, height - reserveFooter - fixedVisible.length);
 	const selected: RunLedgerLine[][] = [];
 	let used = 0;
-	for (const row of [...state.timeline].reverse()) {
-		const block = timelineLines(row, width, state.startedAt ?? row.ts);
-		if (block.length <= remaining - used) { selected.unshift(block); used += block.length; }
-		else if (used === 0 && remaining > 0) { selected.unshift(block.slice(0, remaining)); used = remaining; }
+	for (const block of [...blocks].reverse()) {
+		if (block.lines.length <= remaining - used) { selected.unshift(block.lines); used += block.lines.length; }
+		else if (used === 0 && remaining > 0) { selected.unshift(block.lines.slice(0, remaining)); used = remaining; }
 		if (used >= remaining) break;
 	}
 	return { lines: [...fixedVisible, ...selected.flat(), ...(footer ? [footer] : [])], width, height };

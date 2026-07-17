@@ -28,9 +28,8 @@ import {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
-	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Text, matchesKey, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
+import { Text, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	DEFAULT_CURSOR_MODEL,
@@ -43,10 +42,17 @@ import {
 import { listSubagentModels, subagentModelToolResult } from "./model-catalog.ts";
 import { Mailbox, resolveAndSettlePermission, type MailEvent as MailboxEvent } from "./mailbox.ts";
 import {
+	createRunLedgerState,
+	parseRunLedgerJsonl,
+	reduceRunLedgerEvents,
 	normalizeRunLedgerEvent,
 	generatedThoughtPreview,
+	sanitizeTerminalText,
 	type RunLedgerEvent,
+	type RunLedgerState,
 } from "./run-ledger.ts";
+import { JOURNAL_TAIL_BYTES, JOURNAL_TAIL_LINES, RAW_TAIL_BYTES, RAW_TAIL_LINES, readBoundedTail } from "./run-ledger-viewer.ts";
+import { RunLedgerOverlay, type LedgerOverlaySource } from "./run-ledger-overlay.ts";
 import {
 	ALLOW_ONCE_IDS,
 	cancelledPermissionResult,
@@ -733,6 +739,7 @@ class UnifiedManager {
 	private readonly draining = new Set<string>();
 	private readonly drainRequested = new Set<string>();
 	private readonly lastActivityCommit = new Map<string, number>();
+	private readonly ledgerRevisions = new Map<string, number>();
 	private ctx?: ExtensionContext;
 	private parentSeq = 0;
 	private ledgerSeq = 0;
@@ -837,7 +844,7 @@ class UnifiedManager {
 
 	snapshot(parentSessionId: string): ManagerStateSnapshot {
 		const infos = this.readScope(parentSessionId); const queued = infos.filter((info) => info.status === "queued").sort((a, b) => (a.turnSequence ?? 0) - (b.turnSequence ?? 0));
-		return { parentSessionId, agents: infos.map((info) => { const live = this.live.get(info.id); return { id: info.id, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.backend === "pi" ? info.thinking : undefined, status: info.status, createdAt: info.createdAt, updatedAt: info.updatedAt, startedAt: info.startedAt, completedAt: info.completedAt, closedAt: info.closedAt, lastActivityAt: info.lastActivity, activity: this.currentActivity(info) ? compactActivityText(this.currentActivity(info), 120) : null, turnId: info.currentTurnId, turnSequence: info.turnSequence, terminalReason: info.terminalReason, queuePosition: info.status === "queued" ? queued.findIndex((entry) => entry.id === info.id) + 1 : undefined, permissionPending: !!live && (live.promptPermissionPending || live.pendingApprovals.size > 0), metrics: info.backend === "pi" && info.metrics ? { ...info.metrics, ...(info.metrics.contextUsage ? { contextUsage: { ...info.metrics.contextUsage } } : {}) } : undefined }; }) };
+		return { parentSessionId, agents: infos.map((info) => { const live = this.live.get(info.id); return { id: info.id, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.backend === "pi" ? info.thinking : undefined, status: info.status, createdAt: info.createdAt, updatedAt: info.updatedAt, startedAt: info.startedAt, completedAt: info.completedAt, closedAt: info.closedAt, lastActivityAt: info.lastActivity, activity: this.currentActivity(info) ? compactActivityText(this.currentActivity(info), 120) : null, turnId: info.currentTurnId, turnSequence: info.turnSequence, turnOrdinal: info.turn, terminalReason: info.terminalReason, queuePosition: info.status === "queued" ? queued.findIndex((entry) => entry.id === info.id) + 1 : undefined, permissionPending: !!live && (live.promptPermissionPending || live.pendingApprovals.size > 0), ledgerRevision: this.ledgerRevisions.get(info.id) ?? 0, metrics: info.backend === "pi" && info.metrics ? { ...info.metrics, ...(info.metrics.contextUsage ? { contextUsage: { ...info.metrics.contextUsage } } : {}) } : undefined }; }) };
 	}
 	subscribe(parent: string, listener: ManagerStateListener): () => void {
 		const listeners = this.stateListeners.get(parent) ?? new Set<ManagerStateListener>();
@@ -858,6 +865,33 @@ class UnifiedManager {
 	templateDirectory(): string { return this.paths.agentsDir; }
 	list(parent: string, includeAll = false, pathPrefix?: string): AgentInfo[] { const prefix = pathPrefix?.trim().replace(/^\/+/, ""); return (includeAll ? this.readAll() : this.readScope(parent)).filter((info) => !prefix || info.taskName.startsWith(prefix)); }
 	get(target: string, parent: string): AgentInfo { const name = normalizeTaskName(target); const info = this.readScope(parent).find((entry) => entry.taskName === name); if (!info) throw new Error(`Agent not found in this parent session: /${name}`); return info; }
+	overlayInfo(target: string, parent: string, readOnly: boolean): AgentInfo {
+		const name = normalizeTaskName(target); const infos = readOnly ? this.readAll() : this.readScope(parent);
+		const info = infos.find((entry) => entry.parentSessionId === parent && entry.taskName === name); if (!info) throw new Error(`Agent not found: /${name}`); return info;
+	}
+	overlaySource(info: AgentInfo, readOnly: boolean): LedgerOverlaySource {
+		const staticSnapshot = (): ManagerStateSnapshot["agents"][number] => ({
+			id: info.id, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.backend === "pi" ? info.thinking : undefined,
+			status: info.status, createdAt: info.createdAt, updatedAt: info.updatedAt, startedAt: info.startedAt, completedAt: info.completedAt, closedAt: info.closedAt,
+			lastActivityAt: info.lastActivity, activity: null, turnId: info.currentTurnId, turnSequence: info.turnSequence, turnOrdinal: info.turn,
+			terminalReason: info.terminalReason, permissionPending: false, ledgerRevision: 0,
+			metrics: info.backend === "pi" && info.metrics ? { ...info.metrics, ...(info.metrics.contextUsage ? { contextUsage: { ...info.metrics.contextUsage } } : {}) } : undefined,
+		});
+		const getAgent = () => readOnly ? staticSnapshot() : this.snapshot(info.parentSessionId).agents.find((agent) => agent.id === info.id);
+		const getLedger = (): RunLedgerState | undefined => {
+			const agent = getAgent(); if (!agent) return undefined;
+			const parsed = parseRunLedgerJsonl(readBoundedTail(runLedgerJournalPath(info), JOURNAL_TAIL_BYTES), { maxBytes: JOURNAL_TAIL_BYTES, maxLines: JOURNAL_TAIL_LINES });
+			if (!parsed.events.length) return undefined;
+			return reduceRunLedgerEvents(parsed.events, createRunLedgerState({ runId: agent.id, title: agent.agentName, agentName: agent.agentName, backend: agent.backend, model: agent.model, thinking: agent.thinking, runtimeState: agent.status, turn: agent.turnOrdinal, startedAt: agent.startedAt ?? agent.createdAt, metrics: agent.backend === "pi" ? agent.metrics : undefined }));
+		};
+		return {
+			readOnly, getAgent, getLedger,
+			subscribe: (listener) => readOnly ? () => {} : this.subscribe(info.parentSessionId, (snapshot) => { if (snapshot.agents.some((agent) => agent.id === info.id)) listener(); }),
+			send: async (message) => { if (readOnly) throw new Error("Historical agents are read-only."); return this.send(info.parentSessionId, info.canonicalName, message); },
+			interrupt: async () => { if (readOnly) throw new Error("Historical agents are read-only."); return this.interrupt(info.parentSessionId, info.canonicalName); },
+			readRawDiagnostics: () => readBoundedTail(info.logFile, RAW_TAIL_BYTES).replace(/\r/g, "").split("\n").map((line) => sanitizeTerminalText(line, 500)).filter(Boolean).slice(-RAW_TAIL_LINES),
+		};
+	}
 
 	private execution(agent: ManifestAgent, prompt: string, displayMessage: string): ResolvedExecutionSnapshot {
 		return { backend: agent.backend, cwd: agent.cwd, model: agent.model, provider: agent.provider, modelId: agent.modelId, thinking: agent.thinking, tools: agent.tools, skills: [...agent.skills], skillPaths: [...agent.skillPaths], extensions: [...agent.extensions], extensionPaths: [...agent.extensionPaths], cursorModel: agent.cursorModel, permissionMode: agent.permissionMode, sessionFile: agent.sessionFile, prompt, displayMessage };
@@ -866,7 +900,7 @@ class UnifiedManager {
 		const path = runLedgerJournalPath(info); ensureDir(resolve(path, "..")); const created = !existsSync(path); if (created) writePrivate(path, ""); else try { chmodSync(path, 0o600); } catch {}
 		if (created) { this.appendLedger(info, { kind: "run", runId: info.id, createdAt: info.createdAt, title: info.canonicalName, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.thinking, cwd: info.cwd }); this.appendLedger(info, { kind: "runtime", state: info.status, detail: "journal initialized" }); }
 	}
-	private appendLedger(info: AgentInfo, fields: { kind: RunLedgerEvent["kind"]; turn?: number } & Record<string, unknown>): void { const now = this.now(); const seq = this.ledgerSeq = Math.max(this.ledgerSeq + 1, now * 1000); const event = normalizeRunLedgerEvent({ v: 2, seq, ts: now, turn: info.turn, ...fields }); if (event) try { appendFileSync(runLedgerJournalPath(info), `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 }); } catch {} }
+	private appendLedger(info: AgentInfo, fields: { kind: RunLedgerEvent["kind"]; turn?: number } & Record<string, unknown>): void { const now = this.now(); const seq = this.ledgerSeq = Math.max(this.ledgerSeq + 1, now * 1000); const event = normalizeRunLedgerEvent({ v: 2, seq, ts: now, turn: info.turn, ...fields }); if (event) try { appendFileSync(runLedgerJournalPath(info), `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 }); this.ledgerRevisions.set(info.id, (this.ledgerRevisions.get(info.id) ?? 0) + 1); this.publishState(info.parentSessionId); } catch {} }
 	private async ensurePrerequisites(backend: AgentBackend, cwd: string): Promise<void> { if (this.herdr) return this.herdr.ensure(backend, cwd); if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_WORKSPACE_ID) throw new Error("Subagents require Pi to run inside a Herdr workspace."); const commands: Array<[string, string[]]> = [[resolveExecutable("herdr", process.env.HERDR_BIN), ["--version"]], backend === "cursor" ? [resolveExecutable("agent", process.env.CURSOR_AGENT_BIN), ["--version"]] : [piInvocation().command, ["--version"]]]; for (const [command, args] of commands) { const result = await this.commandRunner(command, args, cwd, 5000); if (result.code !== 0) throw new Error((result.stderr || `${command} is unavailable`).trim()); } }
 	private piRuntimeAgent(agent: ManifestAgent): PiRuntimeAgent { return { canonicalName: agent.canonicalName, cwd: agent.cwd, provider: agent.provider, modelId: agent.modelId, thinking: agent.thinking, tools: agent.tools, skillPaths: [...agent.skillPaths], extensionPaths: [...agent.extensionPaths], sessionFile: agent.sessionFile, logFile: agent.logFile }; }
 	private herdrAgent(info: AgentInfo): HerdrAgent { return { id: info.id, canonicalName: info.canonicalName, backend: info.backend, cwd: info.cwd, viewerPaneId: info.viewerPaneId, viewerTabId: info.viewerTabId }; }
@@ -1398,65 +1432,6 @@ class UnifiedManager {
 }
 
 
-class AgentLogOverlay {
-	private readonly tui: TUI;
-	private readonly manager: UnifiedManager;
-	private readonly theme: Theme;
-	private readonly parentSessionId: string;
-	private readonly target: string;
-	private readonly done: (navigation?: "previous" | "next") => void;
-	private timer?: ReturnType<typeof setInterval>;
-	private scroll = Number.MAX_SAFE_INTEGER;
-	private cache: string[] = [];
-	constructor(tui: TUI, theme: Theme, manager: UnifiedManager, parentSessionId: string, target: string, done: (navigation?: "previous" | "next") => void) {
-		this.tui = tui;
-		this.theme = theme;
-		this.manager = manager;
-		this.parentSessionId = parentSessionId;
-		this.target = target;
-		this.done = done;
-		this.reload();
-		this.timer = setInterval(() => { this.reload(); this.tui.requestRender(); }, 250);
-	}
-	private reload(): void {
-		try {
-			const info = this.manager.get(this.target, this.parentSessionId);
-			const raw = existsSync(info.logFile) ? readFileSync(info.logFile, "utf8") : "";
-			this.cache = raw.replace(/\r/g, "").split("\n");
-		} catch { this.cache = ["Agent unavailable."]; }
-	}
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || data === "q") { this.dispose(); this.done(); }
-		else if (matchesKey(data, "left")) { this.dispose(); this.done("previous"); }
-		else if (matchesKey(data, "right")) { this.dispose(); this.done("next"); }
-		else if (matchesKey(data, "up") || data === "k") { this.scroll = Math.max(0, Math.min(this.cache.length, this.scroll) - 1); }
-		else if (matchesKey(data, "down") || data === "j") { this.scroll = Math.min(this.cache.length, Math.min(this.cache.length, this.scroll) + 1); }
-		else if (data === "g") this.scroll = 0;
-		else if (data === "G") this.scroll = Number.MAX_SAFE_INTEGER;
-		this.tui.requestRender();
-	}
-	render(width: number): string[] {
-		let info: AgentInfo;
-		try { info = this.manager.get(this.target, this.parentSessionId); }
-		catch { return [truncateToWidth("Agent unavailable", width)]; }
-		const inner = Math.max(20, width - 2);
-		const height = Math.max(6, Math.min(50, this.tui.terminal.rows - 8));
-		const maxScroll = Math.max(0, this.cache.length - height);
-		if (this.scroll === Number.MAX_SAFE_INTEGER) this.scroll = maxScroll;
-		this.scroll = Math.min(maxScroll, this.scroll);
-		const statusColor = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning";
-		const top = `╭ ${info.canonicalName} [${info.backend}] ${info.model} · ${info.status} `;
-		const lines = [truncateToWidth(this.theme.fg(statusColor, top.padEnd(inner + 1, "─") + "╮"), width)];
-		for (const line of this.cache.slice(this.scroll, this.scroll + height)) lines.push(`│${truncateToWidth(line, inner).padEnd(inner)}│`);
-		while (lines.length < height + 1) lines.push(`│${" ".repeat(inner)}│`);
-		const footer = "←/→ agent · j/k scroll · g/G top/end · q close";
-		lines.push(`╰${truncateToWidth(footer, inner).padEnd(inner, "─")}╯`);
-		return lines.map((line) => truncateToWidth(line, width));
-	}
-	invalidate(): void {}
-	dispose(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
-}
-
 function textResult(text: string, details?: Record<string, unknown>) {
 	return { content: [{ type: "text" as const, text }], details };
 }
@@ -1710,9 +1685,11 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		if (ctx.mode !== "tui") { ctx.ui.notify("Agent overlays require TUI mode.", "warning"); return; }
 		let target = `/${normalizeTaskName(initialTarget)}`;
 		for (;;) {
-			const navigation = await ctx.ui.custom<"previous" | "next" | undefined>((tui, theme, _keys, done) => new AgentLogOverlay(tui, theme, manager, scopeParent, target, done), {
+			let info: AgentInfo; try { info = manager.overlayInfo(target, scopeParent, includeAll); } catch { ctx.ui.notify(`Agent unavailable: ${target}`, "warning"); return; }
+			const source = manager.overlaySource(info, includeAll);
+			const navigation = await ctx.ui.custom<"previous" | "next" | undefined>((tui, theme, keys, done) => new RunLedgerOverlay(tui, theme, keys, source, done), {
 				overlay: true,
-				overlayOptions: { anchor: "right-center", width: "50%", minWidth: 60, maxHeight: 60, margin: { right: 2, top: 2, bottom: 2 } },
+				overlayOptions: { anchor: "center", width: "90%", maxHeight: "80%", margin: 1 },
 			});
 			if (!navigation) return;
 			const infos = manager.list(manager.parentSessionId(ctx), includeAll);
