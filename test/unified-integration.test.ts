@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
 import { registerUnifiedSubagents } from "../extensions/unified.ts";
 import type {
@@ -95,7 +98,7 @@ class Gate {
 
 interface ProjectionCapture { pi: Array<Record<string, unknown>>; herdr: Array<Record<string, unknown>>; }
 
-function dependencies(root: string, events: string[], runtimes: FakeRuntimes, observer: (value: UnifiedTestObserver) => void, options: { failPiStart?: boolean; viewerCloseGate?: Gate; projections?: ProjectionCapture; mutateProjections?: boolean } = {}): UnifiedSubagentDependencies {
+function dependencies(root: string, events: string[], runtimes: FakeRuntimes, observer: (value: UnifiedTestObserver) => void, options: { failPiStart?: boolean; viewerCloseGate?: Gate; failViewerCloseFor?: Set<string>; projections?: ProjectionCapture; mutateProjections?: boolean } = {}): UnifiedSubagentDependencies {
 	let tick = 1_000;
 	let id = 0;
 	const herdr: HerdrOperations = {
@@ -113,6 +116,7 @@ function dependencies(root: string, events: string[], runtimes: FakeRuntimes, ob
 			if (options.mutateProjections) Object.assign(info, { canonicalName: "/corrupted-close", finalResponse: "leak" });
 			events.push(`viewer:close:${safe.canonicalName}:${safe.viewerPaneId}/${safe.viewerTabId}`);
 			await options.viewerCloseGate?.wait;
+			if (options.failViewerCloseFor?.has(safe.canonicalName)) throw new Error("viewer close failed");
 		},
 	};
 	return {
@@ -137,6 +141,8 @@ async function execute(api: ReturnType<typeof fakeApi>, name: string, params: un
 }
 
 async function turn() { await new Promise<void>((resolve) => setImmediate(resolve)); }
+const execFileAsync = promisify(execFile);
+async function git(cwd: string, ...args: string[]) { return execFileAsync("git", args, { cwd, encoding: "utf8" }); }
 
 test("registered template catalog is trust-gated, prompt-safe, project-preferred, and hot-read by spawn", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-unified-templates-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver;
@@ -173,6 +179,29 @@ test("project skills require both trust gates and global templates cannot bind s
 		await execute(api, "spawn_agent", { task_name: "project", message: "x", backend: "pi", agent_type: "project-local" }, context("trusted-resource", root, true)); await turn();
 		assert.deepEqual(projections.pi.at(-1)?.skillPaths, [await realpath(projectSkill)]);
 	} finally { await observer.shutdown(); await rm(root, { recursive: true, force: true }); await rm(outsideSkill, { recursive: true, force: true }); }
+});
+
+test("managed worktree spawn is backend-neutral and close preserves or removes changes safely", async () => {
+	const base = await mkdtemp(join(tmpdir(), "pi-unified-worktrees-")); const repo = join(base, "repo"); const packageRoot = join(base, "package"); await mkdir(repo); await mkdir(packageRoot);
+	await git(repo, "init", "-b", "main"); await git(repo, "config", "user.email", "test@example.com"); await git(repo, "config", "user.name", "Test"); await writeFile(join(repo, "README.md"), "base\n"); await git(repo, "add", "README.md"); await git(repo, "commit", "-m", "base");
+	const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); const projections: ProjectionCapture = { pi: [], herdr: [] }; const failViewerCloseFor = new Set<string>(); let observer!: UnifiedTestObserver;
+	registerUnifiedSubagents(api, dependencies(packageRoot, events, runtimes, (value) => { observer = value; }, { projections, failViewerCloseFor })); const ctx = context("worktree-parent", repo);
+	try {
+		const clean = await execute(api, "spawn_agent", { task_name: "clean", message: "x", backend: "pi", isolation: "worktree" }, ctx); await turn(); const cleanRoot = clean.details.worktree.worktree_root; assert.ok(existsSync(cleanRoot)); assert.equal(projections.pi.at(-1)?.cwd, clean.details.worktree.cwd); assert.equal(projections.herdr.at(-1)?.cwd, clean.details.worktree.cwd);
+		runtimes.settlePi("/clean"); await execute(api, "wait_agent", { targets: ["clean"] }, ctx); const cleanClosed = await execute(api, "close_agent", { target: "clean" }, ctx); assert.equal(cleanClosed.details.worktree.phase, "removed"); assert.equal(existsSync(cleanRoot), false); await assert.rejects(() => git(repo, "show-ref", "--verify", `refs/heads/${clean.details.worktree.branch}`));
+
+		const dirty = await execute(api, "spawn_agent", { task_name: "dirty", message: "x", backend: "pi", isolation: "worktree" }, ctx); await turn(); runtimes.settlePi("/dirty"); await execute(api, "wait_agent", { targets: ["dirty"] }, ctx); await execute(api, "send_message", { target: "dirty", message: "follow up" }, ctx); await turn(); assert.equal(projections.pi.at(-1)?.cwd, dirty.details.worktree.cwd); runtimes.settlePi("/dirty"); await execute(api, "wait_agent", { targets: ["dirty"] }, ctx); await writeFile(join(dirty.details.worktree.worktree_root, "dirty.txt"), "preserve\n"); const dirtyClosed = await execute(api, "close_agent", { target: "dirty" }, ctx); assert.equal(dirtyClosed.details.worktree.phase, "retained-both"); assert.equal(dirtyClosed.details.worktree.reason, "dirty"); assert.ok(existsSync(dirty.details.worktree.worktree_root));
+
+		const committed = await execute(api, "spawn_agent", { task_name: "committed", message: "x", backend: "pi", isolation: "worktree" }, ctx); await turn(); runtimes.settlePi("/committed"); await execute(api, "wait_agent", { targets: ["committed"] }, ctx); await writeFile(join(committed.details.worktree.worktree_root, "commit.txt"), "keep branch\n"); await git(committed.details.worktree.worktree_root, "add", "commit.txt"); await git(committed.details.worktree.worktree_root, "commit", "-m", "agent change"); const committedClosed = await execute(api, "close_agent", { target: "committed" }, ctx); assert.equal(committedClosed.details.worktree.phase, "retained-branch"); assert.equal(existsSync(committed.details.worktree.worktree_root), false); await git(repo, "show-ref", "--verify", `refs/heads/${committed.details.worktree.branch}`);
+
+		const cursor = await execute(api, "spawn_agent", { task_name: "cursor-wt", message: "x", backend: "cursor", isolation: "worktree" }, ctx); await turn(); assert.ok(runtimes.cursor.has(cursor.details.worktree.cwd)); const cursorClosed = await execute(api, "close_agent", { target: "cursor-wt" }, ctx); assert.equal(cursorClosed.details.worktree.phase, "removed");
+
+		const viewerFailure = await execute(api, "spawn_agent", { task_name: "viewer-fail", message: "x", backend: "pi", isolation: "worktree" }, ctx); await turn(); failViewerCloseFor.add("/viewer-fail"); const retainedForViewer = await execute(api, "close_agent", { target: "viewer-fail" }, ctx); assert.equal(retainedForViewer.details.worktree.phase, "active"); assert.ok(existsSync(viewerFailure.details.worktree.worktree_root)); failViewerCloseFor.delete("/viewer-fail"); const retriedClose = await execute(api, "close_agent", { target: "viewer-fail" }, ctx); assert.equal(retriedClose.details.worktree.phase, "removed");
+
+		const missing = await execute(api, "spawn_agent", { task_name: "missing", message: "x", backend: "pi", isolation: "worktree" }, ctx); await turn(); runtimes.settlePi("/missing"); await execute(api, "wait_agent", { targets: ["missing"] }, ctx); await rm(missing.details.worktree.worktree_root, { recursive: true, force: true }); await assert.rejects(() => execute(api, "send_message", { target: "missing", message: "must fail closed" }, ctx), /ownership verification/); const missingClosed = await execute(api, "close_agent", { target: "missing" }, ctx); assert.equal(missingClosed.details.worktree.phase, "retained-both");
+
+		const reload = await execute(api, "spawn_agent", { task_name: "reload-retain", message: "x", backend: "pi", isolation: "worktree" }, ctx); await turn(); await api.emit("session_shutdown"); assert.ok(existsSync(reload.details.worktree.worktree_root), "shutdown must retain managed worktree");
+	} finally { await observer.shutdown().catch(() => undefined); await rm(base, { recursive: true, force: true }); }
 });
 
 test("registered tools remain detached, isolated, serialized, and observable through the narrow test observer", async () => {

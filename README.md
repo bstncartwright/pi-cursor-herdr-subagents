@@ -35,7 +35,7 @@ Run `/reload` after changing the installed package.
 |---|---|
 | `list_subagent_models` | Discover exact backend-specific model and thinking parameters with filtering and pagination |
 | `list_agent_templates` | List effective global and trusted project-local templates without exposing prompt bodies |
-| `spawn_agent` | Spawn a fresh-context Pi or Cursor ACP agent; `backend` is required and Pi model/thinking overrides are optional |
+| `spawn_agent` | Spawn a fresh-context Pi or Cursor ACP agent; supports shared or managed-worktree filesystem isolation |
 | `wait_agent` | Wait for one completion or Cursor permission request |
 | `wait_all_agents` | Wait for all selected agents; returns early for a permission request |
 | `list_agents` | List current-session agents or read-only history |
@@ -113,6 +113,7 @@ Pi backend:
   "task_name": "review/api",
   "message": "Review the API changes and return findings with file paths.",
   "backend": "pi",
+  "isolation": "worktree",
   "pi_model": "openai-codex/gpt-5.6-terra",
   "pi_thinking": "high"
 }
@@ -189,6 +190,7 @@ Runtime data is stored under:
 ~/.pi/agent/pi-bstn-subagents/
 ├── config.json
 ├── agents/*.md
+├── worktrees/<parent-scope>/<agent-id>/  # managed worktrees retained only when recovery requires them
 └── runs/<parent-session-hash>/
     ├── queue.manifest.json   # private canonical agent/turn scheduler state
     ├── <id>.info.json        # regenerated compatibility projection; never authoritative
@@ -198,7 +200,7 @@ Runtime data is stored under:
     └── <id>.session.jsonl   # Pi backend
 ```
 
-The private manifest is the sole lifecycle authority. It is currently schema v2 and strictly upgrades v1 manifests under the manifest lock; old journals remain readable. `.info.json` is regenerated from it on writes and reads for compatibility with existing viewers; deleting a projection does not lose state. A corrupt manifest fails closed rather than guessing from projections. Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
+The private manifest is the sole lifecycle authority. It is currently schema v3 and strictly upgrades v1/v2 manifests under the manifest lock; old journals remain readable. `.info.json` is regenerated from it on writes and reads for compatibility with existing viewers; deleting a projection does not lose state. A corrupt manifest fails closed rather than guessing from projections. Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
 
 Optional `config.json`:
 
@@ -207,6 +209,7 @@ Optional `config.json`:
   "storageDir": "~/tmp/pi-agent-runs",
   "trustedProjects": ["/absolute/canonical/path/to/project"],
   "defaults": {
+    "isolation": "shared",
     "skills": ["web-investigate"],
     "extensions": ["@scope/pi-extra-tools"]
   }
@@ -254,7 +257,19 @@ Review the requested code and prioritize correctness defects.
 
 Use `list_agent_templates` before selecting `agent_type`. Template names must match `^[a-z][a-z0-9_-]{0,63}$`. The catalog is rebuilt for each listing and spawn, so edits need no watcher or `/reload`. A trusted project template overrides a global template with the same name. Duplicate or case-colliding names within one scope fail closed; a conflicted project name never falls back to a global definition. Symlinked directories/files, non-regular files, and templates larger than 64 KiB are rejected. Catalog results include only safe metadata and diagnostics—not prompt bodies.
 
-The explicit `backend` passed to `spawn_agent` must agree with the template. Pi templates may set provider/model, thinking, tools, skills, and installed extensions. Explicit `pi_model` and `pi_thinking` override those template values independently; otherwise the template overrides parent inheritance. A selected template that specifies either `provider` or `model` must provide a complete nonempty pair unless an explicit `pi_model` overrides it. Project templates may run only inside their canonical trusted project root. Named resources from global templates/defaults resolve globally; project resource lookup is enabled only for package-approved trusted projects. Automatic child extension, skill, and prompt-template discovery is disabled.
+The explicit `backend` passed to `spawn_agent` must agree with the template. Pi templates may set provider/model, thinking, tools, skills, and installed extensions. Templates may set backend-neutral `isolation: shared|worktree`. Explicit `pi_model`, `pi_thinking`, and `isolation` override template/default values. A selected template that specifies either `provider` or `model` must provide a complete nonempty pair unless an explicit `pi_model` overrides it. Project templates may run only inside their canonical trusted project root. Named resources from global templates/defaults resolve globally; project resource lookup is enabled only for package-approved trusted projects. Automatic child extension, skill, and prompt-template discovery is disabled.
+
+## Managed Git worktrees
+
+`isolation: "shared"` preserves the existing behavior and remains the default. `isolation: "worktree"` requires a non-bare Git repository with a named branch, at least one commit, and no staged, tracked, or untracked changes. The package records a durable plan before creating `pi-bstn/<parent-scope>/<task>-<turn>-<id>` and runs Pi, Cursor, and the Herdr viewer from the matching package-owned worktree subdirectory. Follow-up turns reuse the same worktree.
+
+The package never stashes, commits, rebases, merges, or discards agent changes. On explicit or idle close:
+
+- clean and unchanged: remove the worktree and managed branch;
+- clean with commits: remove the worktree and retain the branch;
+- dirty, untracked, detached, branch-changed, unverified, or cleanup-failed: retain both path and branch.
+
+`spawn_agent`, `list_agents`, and `close_agent` return recovery metadata. Shutdown/reload never removes worktrees. A missing or unverified retained worktree blocks follow-up instead of silently falling back to the parent checkout.
 
 ## UI and Herdr
 
@@ -275,6 +290,7 @@ The parent Herdr pane remains `working` while its attached parent manifest has q
 This package and every child agent run with your full system permissions. There is no sandbox.
 
 - Pi children load only explicitly selected skills/extensions, but their tools can still mutate the working tree.
+- Managed worktrees isolate Git filesystem edits, not processes, credentials, networks, tools, or external side effects. Retained branches/worktrees require explicit human review and merge.
 - Cursor ACP permission handling does not sandbox approved operations.
 - Raw `.events.log` files retain their existing forensic behavior and can contain prompts, thoughts, output, and paths. The native overlay reads them only after explicit double confirmation and never stores them in semantic overlay state.
 - The private `.viewer.jsonl` journal is created mode `0600`. It stores versioned, bounded, terminal-safe/redacted semantic summaries only: never raw thought chunks, raw command text, tool arguments, or tool output. Thought entries retain only a generic/heading preview plus counts. Tool commands use a small semantic allowlist (for example `npm test`); otherwise only a program label and character count are stored. Tool updates retain status/counts, and outcomes retain allowlisted structural metadata or opaque character counts. Raw details remain solely in the legacy log.

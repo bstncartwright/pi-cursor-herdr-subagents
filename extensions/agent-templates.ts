@@ -22,6 +22,7 @@ export interface AgentTemplate {
 	extensions?: string[];
 	cursorModel?: CursorModel;
 	permissionMode?: PermissionMode;
+	isolation?: "shared" | "worktree";
 	prompt?: string;
 }
 
@@ -93,6 +94,7 @@ export function parseAgentTemplateText(text: string, fallbackName: string): Agen
 		extensions: stringList(frontmatter.extensions),
 		cursorModel,
 		permissionMode,
+		isolation: frontmatter.isolation === "shared" || frontmatter.isolation === "worktree" ? frontmatter.isolation : undefined,
 		prompt: body.trim() || undefined,
 	};
 }
@@ -211,7 +213,7 @@ export function resolveAgentTemplate(catalog: AgentTemplateCatalog, name: string
 
 export function publicAgentTemplateCatalog(catalog: AgentTemplateCatalog): Record<string, unknown> {
 	return {
-		templates: catalog.templates.map(({ name, scope, backend, description, hint, source, shadowsGlobal }) => ({ name, scope, backend: backend ?? null, description: description ?? null, hint: hint ?? null, source, shadows_global: shadowsGlobal })),
+		templates: catalog.templates.map(({ name, scope, backend, description, hint, isolation, source, shadowsGlobal }) => ({ name, scope, backend: backend ?? null, description: description ?? null, hint: hint ?? null, isolation: isolation ?? null, source, shadows_global: shadowsGlobal })),
 		project_status: catalog.projectStatus,
 		conflicted_names: catalog.conflictedNames,
 		diagnostics: catalog.diagnostics,

@@ -67,6 +67,7 @@ Review carefully.`, "fallback");
 		extensions: undefined,
 		cursorModel: "Grok 4.5 High",
 		permissionMode: "deny",
+		isolation: undefined,
 		prompt: "Review carefully.",
 	});
 });

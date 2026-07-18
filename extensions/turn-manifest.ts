@@ -4,9 +4,9 @@
  * source of truth during that intermediate step.
  */
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-export const TURN_MANIFEST_VERSION = 2 as const;
+export const TURN_MANIFEST_VERSION = 3 as const;
 export const TURN_MANIFEST_FILE = "queue.manifest.json";
 export const TURN_MANIFEST_LOCK_FILE = ".lock";
 export const TURN_MANIFEST_RECLAIM_FILE = ".lock.reclaim";
@@ -25,6 +25,14 @@ export type TurnState = "queued" | "admitted" | "running" | "terminal";
 export type TerminalStatus = "completed" | "failed" | "interrupted" | "paused";
 export type TurnSource = "initial" | "follow-up" | "cursor-correction";
 export type AgentProjectionStatus = "queued" | "starting" | "running" | TerminalStatus | "closed";
+export type IsolationMode = "shared" | "worktree";
+export type ManagedWorktreePhase = "planned" | "active" | "removed" | "retained-branch" | "retained-both" | "failed";
+export type ManagedWorktreeReason = "clean-unchanged" | "commits-preserved" | "dirty" | "branch-changed" | "detached" | "ownership-uncertain" | "inspection-failed" | "allocation-failed" | "cleanup-failed" | "missing";
+export interface ManagedWorktreeState {
+	sourceRepoRoot: string; sourceCwd: string; sourceSubdir: string; gitCommonDir: string; baseCommit: string; sourceBranch?: string;
+	branch: string; worktreeRoot: string; cwd: string; createdAt: number; phase: ManagedWorktreePhase;
+	finalCommit?: string; finalBranch?: string; changedFiles?: number; untrackedFiles?: number; reason?: ManagedWorktreeReason; error?: string;
+}
 
 export interface ResolvedExecutionSnapshot {
 	backend: ManifestBackend;
@@ -91,6 +99,8 @@ export interface ManifestAgent {
 	parentSessionId: string;
 	parentSessionFile?: string;
 	agentType?: string;
+	isolation: IsolationMode;
+	worktree?: ManagedWorktreeState;
 	cwd: string;
 	model: string;
 	provider?: string;
@@ -122,7 +132,7 @@ export interface ManifestAgent {
 	metrics?: AgentMetrics;
 }
 
-export interface ParentManifestV2 {
+export interface ParentManifestV3 {
 	version: typeof TURN_MANIFEST_VERSION;
 	parentSessionId: string;
 	epoch: string;
@@ -131,8 +141,8 @@ export interface ParentManifestV2 {
 	agents: Record<string, ManifestAgent>;
 	turns: Record<string, ManifestTurn>;
 }
-/** Compatibility type name for existing internal callers; emitted schema is v2. */
-export type ParentManifestV1 = ParentManifestV2;
+/** Compatibility type name for existing internal callers; emitted schema is v3. */
+export type ParentManifestV1 = ParentManifestV3;
 
 export interface AgentInfoProjection {
 	id: string;
@@ -142,6 +152,8 @@ export interface AgentInfoProjection {
 	parentSessionId: string;
 	parentSessionFile?: string;
 	agentType?: string;
+	isolation: IsolationMode;
+	worktree?: ManagedWorktreeState;
 	cwd: string;
 	model: string;
 	provider?: string;
@@ -179,7 +191,8 @@ export interface AgentInfoProjection {
 	metrics?: AgentMetrics;
 }
 
-export interface AddAgentInput extends Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed" | "closedAt" | "closeReason"> {
+export interface AddAgentInput extends Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed" | "closedAt" | "closeReason" | "isolation"> {
+	isolation?: IsolationMode;
 	closed?: boolean;
 	closedAt?: number;
 	closeReason?: string;
@@ -264,11 +277,16 @@ export function parseParentManifest(input: unknown, options: ParseManifestOption
 	const root = { ...object(input, "manifest") };
 	const allowedRoot = ["version", "parentSessionId", "epoch", "nextSequence", "updatedAt", "agents", "turns"];
 	exactKeys(root, allowedRoot, "manifest");
-	// v1 had no metrics. Upgrade only this exact durable shape, then validate as v2.
+	// v1 had no metrics; v1/v2 had no isolation/worktree state.
 	if (root.version === 1) {
-		for (const rawAgent of Object.values(object(root.agents, "manifest.agents"))) if (rawAgent && typeof rawAgent === "object" && Object.prototype.hasOwnProperty.call(rawAgent, "metrics")) fail("v1 manifest must not contain metrics");
-		root.version = TURN_MANIFEST_VERSION;
+		for (const rawAgent of Object.values(object(root.agents, "manifest.agents"))) if (rawAgent && typeof rawAgent === "object" && (Object.prototype.hasOwnProperty.call(rawAgent, "metrics") || Object.prototype.hasOwnProperty.call(rawAgent, "isolation") || Object.prototype.hasOwnProperty.call(rawAgent, "worktree"))) fail("v1 manifest contains fields from a newer version");
+	} else if (root.version === 2) {
+		for (const rawAgent of Object.values(object(root.agents, "manifest.agents"))) if (rawAgent && typeof rawAgent === "object" && (Object.prototype.hasOwnProperty.call(rawAgent, "isolation") || Object.prototype.hasOwnProperty.call(rawAgent, "worktree"))) fail("v2 manifest contains worktree fields");
 	} else if (root.version !== TURN_MANIFEST_VERSION) fail(`version ${String(root.version)} is unsupported`);
+	if (root.version === 1 || root.version === 2) {
+		root.agents = Object.fromEntries(Object.entries(object(root.agents, "manifest.agents")).map(([id, raw]) => [id, { ...object(raw, `manifest.agents.${id}`), isolation: "shared" }]));
+		root.version = TURN_MANIFEST_VERSION;
+	}
 	const manifest: ParentManifestV1 = {
 		version: TURN_MANIFEST_VERSION,
 		parentSessionId: string(root.parentSessionId, "manifest.parentSessionId"),
@@ -329,12 +347,17 @@ function parseMetrics(raw: unknown, path: string): AgentMetrics | undefined {
 	if (value.contextUsage !== undefined) { const context = object(value.contextUsage, `${path}.contextUsage`); exactKeys(context, ["tokens", "contextWindow", "percent"], `${path}.contextUsage`); const tokens = context.tokens; const percent = context.percent; if (tokens !== null && (!Number.isSafeInteger(tokens) || (tokens as number) < 0)) fail(`${path}.contextUsage.tokens must be a nonnegative safe integer or null`); if (percent !== null && (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0)) fail(`${path}.contextUsage.percent must be finite and nonnegative or null`); contextUsage = { tokens: tokens as number | null, contextWindow: safeInt(context.contextWindow, `${path}.contextUsage.contextWindow`), percent: percent as number | null }; }
 	return { sampledAt: safeInt(value.sampledAt, `${path}.sampledAt`), inputTokens: safeInt(value.inputTokens, `${path}.inputTokens`), outputTokens: safeInt(value.outputTokens, `${path}.outputTokens`), cacheReadTokens: safeInt(value.cacheReadTokens, `${path}.cacheReadTokens`), cacheWriteTokens: safeInt(value.cacheWriteTokens, `${path}.cacheWriteTokens`), totalTokens: safeInt(value.totalTokens, `${path}.totalTokens`), cost, ...(contextUsage ? { contextUsage } : {}), compactionCount: safeInt(value.compactionCount, `${path}.compactionCount`) };
 }
+function parseWorktree(raw: unknown, path: string): ManagedWorktreeState | undefined {
+	if (raw === undefined) return undefined;
+	const value = object(raw, path); exactKeys(value, ["sourceRepoRoot", "sourceCwd", "sourceSubdir", "gitCommonDir", "baseCommit", "sourceBranch", "branch", "worktreeRoot", "cwd", "createdAt", "phase", "finalCommit", "finalBranch", "changedFiles", "untrackedFiles", "reason", "error"], path);
+	return { sourceRepoRoot: string(value.sourceRepoRoot, `${path}.sourceRepoRoot`), sourceCwd: string(value.sourceCwd, `${path}.sourceCwd`), sourceSubdir: string(value.sourceSubdir, `${path}.sourceSubdir`, true), gitCommonDir: string(value.gitCommonDir, `${path}.gitCommonDir`), baseCommit: string(value.baseCommit, `${path}.baseCommit`), sourceBranch: optionalString(value.sourceBranch, `${path}.sourceBranch`), branch: string(value.branch, `${path}.branch`), worktreeRoot: string(value.worktreeRoot, `${path}.worktreeRoot`), cwd: string(value.cwd, `${path}.cwd`), createdAt: safeInt(value.createdAt, `${path}.createdAt`), phase: enumValue(value.phase, ["planned", "active", "removed", "retained-branch", "retained-both", "failed"] as const, `${path}.phase`), finalCommit: optionalString(value.finalCommit, `${path}.finalCommit`), finalBranch: optionalString(value.finalBranch, `${path}.finalBranch`), changedFiles: value.changedFiles === undefined ? undefined : safeInt(value.changedFiles, `${path}.changedFiles`), untrackedFiles: value.untrackedFiles === undefined ? undefined : safeInt(value.untrackedFiles, `${path}.untrackedFiles`), reason: optionalEnum(value.reason, ["clean-unchanged", "commits-preserved", "dirty", "branch-changed", "detached", "ownership-uncertain", "inspection-failed", "allocation-failed", "cleanup-failed", "missing"] as const, `${path}.reason`), error: optionalString(value.error, `${path}.error`) };
+}
 function parseAgent(raw: unknown, path: string): ManifestAgent {
 	const value = object(raw, path);
-	exactKeys(value, ["id", "taskName", "canonicalName", "backend", "parentSessionId", "parentSessionFile", "agentType", "cwd", "model", "provider", "modelId", "thinking", "tools", "skills", "skillPaths", "extensions", "extensionPaths", "cursorModel", "permissionMode", "acpSessionId", "acpCapabilities", "sessionFile", "infoFile", "logFile", "responseFile", "viewerPaneId", "viewerTabId", "createdAt", "updatedAt", "currentTurnId", "nextOrdinal", "closed", "closedAt", "closeReason", "metrics"], path);
+	exactKeys(value, ["id", "taskName", "canonicalName", "backend", "parentSessionId", "parentSessionFile", "agentType", "isolation", "worktree", "cwd", "model", "provider", "modelId", "thinking", "tools", "skills", "skillPaths", "extensions", "extensionPaths", "cursorModel", "permissionMode", "acpSessionId", "acpCapabilities", "sessionFile", "infoFile", "logFile", "responseFile", "viewerPaneId", "viewerTabId", "createdAt", "updatedAt", "currentTurnId", "nextOrdinal", "closed", "closedAt", "closeReason", "metrics"], path);
 	return {
 		id: opaqueId(value.id, `${path}.id`), taskName: string(value.taskName, `${path}.taskName`), canonicalName: string(value.canonicalName, `${path}.canonicalName`), backend: enumValue(value.backend, ["pi", "cursor"] as const, `${path}.backend`),
-		parentSessionId: string(value.parentSessionId, `${path}.parentSessionId`), parentSessionFile: optionalString(value.parentSessionFile, `${path}.parentSessionFile`), agentType: optionalString(value.agentType, `${path}.agentType`), cwd: string(value.cwd, `${path}.cwd`), model: string(value.model, `${path}.model`),
+		parentSessionId: string(value.parentSessionId, `${path}.parentSessionId`), parentSessionFile: optionalString(value.parentSessionFile, `${path}.parentSessionFile`), agentType: optionalString(value.agentType, `${path}.agentType`), isolation: enumValue(value.isolation, ["shared", "worktree"] as const, `${path}.isolation`), worktree: parseWorktree(value.worktree, `${path}.worktree`), cwd: string(value.cwd, `${path}.cwd`), model: string(value.model, `${path}.model`),
 		provider: optionalString(value.provider, `${path}.provider`), modelId: optionalString(value.modelId, `${path}.modelId`), thinking: optionalString(value.thinking, `${path}.thinking`), tools: optionalString(value.tools, `${path}.tools`), skills: strings(value.skills, `${path}.skills`), skillPaths: strings(value.skillPaths, `${path}.skillPaths`), extensions: strings(value.extensions, `${path}.extensions`), extensionPaths: strings(value.extensionPaths, `${path}.extensionPaths`),
 		cursorModel: optionalString(value.cursorModel, `${path}.cursorModel`), permissionMode: enumValue(value.permissionMode, ["agent", "prompt", "allow-once", "deny"] as const, `${path}.permissionMode`), acpSessionId: optionalString(value.acpSessionId, `${path}.acpSessionId`), acpCapabilities: capabilities(value.acpCapabilities, `${path}.acpCapabilities`), sessionFile: optionalString(value.sessionFile, `${path}.sessionFile`),
 		infoFile: string(value.infoFile, `${path}.infoFile`), logFile: string(value.logFile, `${path}.logFile`), responseFile: string(value.responseFile, `${path}.responseFile`), viewerPaneId: optionalString(value.viewerPaneId, `${path}.viewerPaneId`), viewerTabId: optionalString(value.viewerTabId, `${path}.viewerTabId`),
@@ -355,6 +378,16 @@ function assertBackendConfig(agent: ManifestAgent): void {
 	assert(!!agent.cursorModel, `Cursor agent ${agent.id} requires cursorModel`);
 	assert(agent.provider === undefined && agent.modelId === undefined && agent.thinking === undefined && agent.tools === undefined && agent.sessionFile === undefined && agent.metrics === undefined, `Cursor agent ${agent.id} has Pi-only config`);
 	assert(agent.skills.length === 0 && agent.skillPaths.length === 0 && agent.extensions.length === 0 && agent.extensionPaths.length === 0, `Cursor agent ${agent.id} must not have skills or extensions`);
+}
+function assertWorktreeConfig(agent: ManifestAgent): void {
+	if (agent.isolation === "shared") { assert(agent.worktree === undefined, `shared agent ${agent.id} must not have worktree state`); return; }
+	const worktree = agent.worktree; assert(!!worktree, `worktree agent ${agent.id} requires worktree state`); assert(agent.cwd === worktree.cwd, `worktree agent ${agent.id} cwd must equal worktree cwd`); assert(worktree.createdAt >= agent.createdAt, `worktree agent ${agent.id} plan predates agent`); assert(!!worktree.sourceBranch, `worktree agent ${agent.id} requires a source branch`);
+	for (const [label, path] of [["sourceRepoRoot", worktree.sourceRepoRoot], ["sourceCwd", worktree.sourceCwd], ["gitCommonDir", worktree.gitCommonDir], ["worktreeRoot", worktree.worktreeRoot], ["cwd", worktree.cwd]] as const) assert(isAbsolute(path) && resolve(path) === path, `worktree agent ${agent.id} ${label} must be canonical absolute`);
+	const sourceRelative = relative(worktree.sourceRepoRoot, worktree.sourceCwd); assert(sourceRelative !== ".." && !sourceRelative.startsWith(`..${sep}`) && !isAbsolute(sourceRelative) && sourceRelative.split(sep).join("/") === worktree.sourceSubdir, `worktree agent ${agent.id} source subdir is inconsistent`);
+	const childRelative = relative(worktree.worktreeRoot, worktree.cwd); assert(childRelative !== ".." && !childRelative.startsWith(`..${sep}`) && !isAbsolute(childRelative) && childRelative.split(sep).join("/") === worktree.sourceSubdir, `worktree agent ${agent.id} cwd escapes worktree root`);
+	assert(/^[0-9a-f]{40}$/i.test(worktree.baseCommit) && (worktree.finalCommit === undefined || /^[0-9a-f]{40}$/i.test(worktree.finalCommit)), `worktree agent ${agent.id} has invalid commit identity`);
+	assert(/^pi-bstn\/[A-Za-z0-9_-]{1,64}\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}-[A-Za-z0-9_-]{1,8}-[A-Za-z0-9_-]{1,8}$/.test(worktree.branch), `worktree agent ${agent.id} branch is not package-owned`);
+	if (worktree.phase === "planned" || worktree.phase === "active") assert(worktree.reason === undefined && worktree.error === undefined && worktree.finalCommit === undefined && worktree.finalBranch === undefined && worktree.changedFiles === undefined && worktree.untrackedFiles === undefined, `active worktree agent ${agent.id} has retention fields`); else assert(worktree.reason !== undefined, `terminal worktree agent ${agent.id} requires a retention reason`);
 }
 function assertExecutionMatchesAgent(turn: ManifestTurn, agent: ManifestAgent): void {
 	const execution = turn.execution;
@@ -393,6 +426,7 @@ export function validateManifest(manifest: ParentManifestV1): void {
 		assert(resolve(agent.infoFile) === agent.infoFile && agent.infoFile === `${pathBase}.info.json` && agent.logFile === `${pathBase}.events.log` && agent.responseFile === `${pathBase}.response.txt` && pathBase.endsWith(`/${agent.id}`), `agent ${agent.id} resource paths must be direct canonical agent paths`);
 		assert(agent.backend === "pi" ? resolve(agent.sessionFile ?? "") === `${pathBase}.session.jsonl` : agent.sessionFile === undefined, `agent ${agent.id} has invalid backend session path`);
 		assertBackendConfig(agent);
+		assertWorktreeConfig(agent);
 		assert(agent.nextOrdinal >= 1, `agent ${agent.id} nextOrdinal must start at 1`);
 		assert(agent.updatedAt >= agent.createdAt, `agent ${agent.id} updatedAt precedes createdAt`);
 		if (agent.closed) assert(agent.closedAt !== undefined && !!agent.closeReason && agent.closedAt >= agent.createdAt, `closed agent ${agent.id} requires ordered closedAt and closeReason`);
@@ -453,7 +487,7 @@ export function addAgent(manifest: ParentManifestV1, input: AddAgentInput, now: 
 	assertMutationTime(manifest, now); assert(input.createdAt <= now && input.updatedAt <= now, `agent ${input.id} timestamps exceed mutation time`);
 	const next = clone(manifest); if (next.agents[input.id]) fail(`agent ${input.id} already exists`);
 	assert(input.parentSessionId === next.parentSessionId, `agent ${input.id} has another parent session`);
-	next.agents[input.id] = { ...clone(input), skills: [...input.skills], skillPaths: [...input.skillPaths], extensions: [...input.extensions], extensionPaths: [...input.extensionPaths], nextOrdinal: 1, currentTurnId: undefined, closed: input.closed ?? false };
+	next.agents[input.id] = { ...clone(input), isolation: input.isolation ?? "shared", skills: [...input.skills], skillPaths: [...input.skillPaths], extensions: [...input.extensions], extensionPaths: [...input.extensionPaths], nextOrdinal: 1, currentTurnId: undefined, closed: input.closed ?? false };
 	next.updatedAt = now; validateManifest(next); return next;
 }
 
@@ -504,6 +538,15 @@ export interface AgentRuntimeResourceUpdate {
 	/** ACP state is Cursor-only; null explicitly clears the persisted value. */
 	acpSessionId?: string | null;
 	acpCapabilities?: { loadSession?: boolean } | null;
+}
+export interface ManagedWorktreeUpdate { phase: Exclude<ManagedWorktreePhase, "planned">; finalCommit?: string; finalBranch?: string; changedFiles?: number; untrackedFiles?: number; reason?: ManagedWorktreeReason; error?: string; }
+export function updateAgentWorktree(manifest: ParentManifestV1, agentId: string, update: ManagedWorktreeUpdate, now: number): ParentManifestV1 {
+	const original = manifest.agents[agentId]; if (!original) fail(`agent ${agentId} does not exist`); assert(original.isolation === "worktree" && !!original.worktree, `agent ${agentId} is not worktree-isolated`); assertMutationTime(manifest, now); assert(now >= original.updatedAt, `mutation time precedes agent ${agentId} updatedAt`);
+	const checked = object(update, "agent worktree update"); exactKeys(checked, ["phase", "finalCommit", "finalBranch", "changedFiles", "untrackedFiles", "reason", "error"], "agent worktree update");
+	const phase = enumValue(update.phase, ["active", "removed", "retained-branch", "retained-both", "failed"] as const, "agent worktree update.phase"); const from = original.worktree.phase;
+	assert((from === "planned" && (phase === "active" || phase === "removed" || phase === "retained-branch" || phase === "failed" || phase === "retained-both")) || ((from === "active" || from === "failed") && (phase === "removed" || phase === "retained-branch" || phase === "retained-both" || phase === "failed")), `illegal worktree transition ${from} -> ${phase}`);
+	const terminal = phase !== "active"; const reason = optionalEnum(update.reason, ["clean-unchanged", "commits-preserved", "dirty", "branch-changed", "detached", "ownership-uncertain", "inspection-failed", "allocation-failed", "cleanup-failed", "missing"] as const, "agent worktree update.reason"); assert(terminal === (reason !== undefined), terminal ? "terminal worktree update requires reason" : "active worktree update must not have reason");
+	const next = clone(manifest); const agent = next.agents[agentId]!; agent.worktree = { ...agent.worktree!, phase, finalCommit: optionalString(update.finalCommit, "agent worktree update.finalCommit"), finalBranch: optionalString(update.finalBranch, "agent worktree update.finalBranch"), changedFiles: update.changedFiles === undefined ? undefined : safeInt(update.changedFiles, "agent worktree update.changedFiles"), untrackedFiles: update.untrackedFiles === undefined ? undefined : safeInt(update.untrackedFiles, "agent worktree update.untrackedFiles"), reason, error: optionalString(update.error, "agent worktree update.error") }; agent.updatedAt = now; next.updatedAt = now; validateManifest(next); return next;
 }
 
 /** Applies the narrowly allowed runtime-owned resource fields without changing execution config. */
@@ -599,7 +642,7 @@ export function projectAgent(agent: ManifestAgent, turn: ManifestTurn | undefine
 	const status: AgentProjectionStatus = agent.closed ? "closed" : !turn ? "interrupted" : turn.state === "queued" ? "queued" : turn.state === "admitted" ? "starting" : turn.state === "running" ? "running" : turn.terminalStatus!;
 	return {
 		id: agent.id, taskName: agent.taskName, canonicalName: agent.canonicalName, backend: agent.backend, parentSessionId: agent.parentSessionId, parentSessionFile: agent.parentSessionFile, agentType: agent.agentType, cwd: agent.cwd, model: agent.model, provider: agent.provider, modelId: agent.modelId, thinking: agent.thinking, tools: agent.tools,
-		skills: [...agent.skills], skillPaths: [...agent.skillPaths], extensions: [...agent.extensions], extensionPaths: [...agent.extensionPaths], cursorModel: agent.cursorModel, permissionMode: agent.permissionMode, acpSessionId: agent.acpSessionId, acpCapabilities: agent.acpCapabilities ? { ...agent.acpCapabilities } : undefined, sessionFile: agent.sessionFile,
+		isolation: agent.isolation, worktree: agent.worktree ? clone(agent.worktree) : undefined, skills: [...agent.skills], skillPaths: [...agent.skillPaths], extensions: [...agent.extensions], extensionPaths: [...agent.extensionPaths], cursorModel: agent.cursorModel, permissionMode: agent.permissionMode, acpSessionId: agent.acpSessionId, acpCapabilities: agent.acpCapabilities ? { ...agent.acpCapabilities } : undefined, sessionFile: agent.sessionFile,
 		infoFile: agent.infoFile, logFile: agent.logFile, responseFile: agent.responseFile, viewerPaneId: agent.viewerPaneId, viewerTabId: agent.viewerTabId, createdAt: agent.createdAt, updatedAt: agent.updatedAt, startedAt: turn?.startedAt ?? turn?.admittedAt, completedAt: turn?.completedAt, closedAt: agent.closedAt, lastActivity: turn?.lastActivityAt ?? agent.updatedAt, turn: turn?.ordinal ?? Math.max(0, agent.nextOrdinal - 1), status, lastTaskMessage: turn?.execution.displayMessage, error: turn?.error, currentTurnId: agent.currentTurnId, terminalReason: turn?.terminalReason,
 		response: turn?.response ? { ...turn.response } : undefined, finalResponse: turn?.response ? options.readResponse?.(turn.response) : undefined, metrics: agent.metrics ? { ...agent.metrics, ...(agent.metrics.contextUsage ? { contextUsage: { ...agent.metrics.contextUsage } } : {}) } : undefined,
 	};

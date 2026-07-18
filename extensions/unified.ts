@@ -40,6 +40,7 @@ import {
 	type JsonRpcMessage,
 } from "./acp.ts";
 import { listSubagentModels, subagentModelToolResult } from "./model-catalog.ts";
+import { allocateManagedWorktree, classifyManagedWorktree, finalizeManagedWorktree, planManagedWorktree, type ManagedWorktreeClassification, type ManagedWorktreePlan } from "./git-worktree.ts";
 import {
 	buildAgentTemplateCatalog,
 	publicAgentTemplateCatalog,
@@ -86,8 +87,8 @@ import { formatWaitProgressRows, makeWaitProgress, waitProgressResult, type Wait
 import {
 	TurnManifestStore, addAgentAtScope, admitFifo, closeAgent as closeManifestAgent, createParentManifest,
 	enqueueTurn, materializeAgentProjections, migrateLegacyInfo, reconcileManifest, replaceCursorTurn,
-	transitionTurn, touchTurn, updateAgentRuntimeResources, updateAgentMetrics,
-	type AgentMetrics, type ManifestAgent, type ManifestTurn, type ParentManifestV1, type ResolvedExecutionSnapshot,
+	transitionTurn, touchTurn, updateAgentRuntimeResources, updateAgentMetrics, updateAgentWorktree,
+	type AgentMetrics, type IsolationMode, type ManagedWorktreeState, type ManifestAgent, type ManifestTurn, type ParentManifestV1, type ResolvedExecutionSnapshot,
 } from "./turn-manifest.ts";
 export { JsonlDecoder, normalizePiCompactionEvent, normalizePiRpcToolEvent };
 export type { NormalizedBackendToolEvent };
@@ -133,6 +134,8 @@ export interface AgentInfo {
 	parentSessionId: string;
 	parentSessionFile?: string;
 	agentType?: string;
+	isolation: IsolationMode;
+	worktree?: ManagedWorktreeState;
 	cwd: string;
 	model: string;
 	provider?: string;
@@ -249,6 +252,7 @@ interface Config {
 	defaults?: {
 		skills?: string[];
 		extensions?: string[];
+		isolation?: IsolationMode;
 	};
 }
 
@@ -319,6 +323,7 @@ interface SpawnParams {
 	pi_thinking?: ThinkingLevel;
 	cursor_model?: string;
 	permission_mode?: PermissionMode;
+	isolation?: IsolationMode;
 }
 
 function ensureDir(path: string): void {
@@ -400,6 +405,22 @@ export function parentScopeKey(parentSessionId: string): string {
 
 export function taskStorageKey(taskName: string): string {
 	return createHash("sha256").update(taskName).digest("hex").slice(0, 24);
+}
+
+function durableWorktree(plan: ManagedWorktreePlan, createdAt: number): ManagedWorktreeState {
+	return { sourceRepoRoot: plan.sourceRoot, sourceCwd: plan.sourceSubdir ? join(plan.sourceRoot, ...plan.sourceSubdir.split("/")) : plan.sourceRoot, sourceSubdir: plan.sourceSubdir, gitCommonDir: plan.commonDir, baseCommit: plan.baseCommit, sourceBranch: plan.sourceBranch, branch: plan.branchName, worktreeRoot: plan.worktreePath, cwd: plan.childCwd, createdAt, phase: "planned" };
+}
+function runtimeWorktree(worktree: ManagedWorktreeState, agentId: string, scopeKey: string, packageRoot: string): ManagedWorktreePlan {
+	return { packageRoot, sourceRoot: worktree.sourceRepoRoot, sourceSubdir: worktree.sourceSubdir, commonDir: worktree.gitCommonDir, baseCommit: worktree.baseCommit, sourceBranch: worktree.sourceBranch ?? "", worktreePath: worktree.worktreeRoot, branchName: worktree.branch, childCwd: worktree.cwd, scopeKey, agentId };
+}
+function worktreeReason(classification: ManagedWorktreeClassification): ManagedWorktreeState["reason"] {
+	if (classification.reason === "clean-unchanged") return "clean-unchanged";
+	if (classification.reason === "clean-with-commits") return "commits-preserved";
+	if (classification.reason === "dirty") return "dirty";
+	if (classification.reason === "branch-changed") return "branch-changed";
+	if (classification.reason === "detached") return "detached";
+	if (classification.reason === "inspection-uncertainty") return "inspection-failed";
+	return "ownership-uncertain";
 }
 
 function scopeDir(parentSessionId: string, paths: UnifiedStoragePaths = PRODUCTION_PATHS): string {
@@ -895,12 +916,21 @@ class UnifiedManager {
 		return run;
 	}
 	async spawn(params: SpawnParams, ctx: ExtensionContext): Promise<AgentInfo> {
-		validateSpawnPiOptions(params.backend, params); const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd; if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Agent cwd is not a directory: ${cwd}`);
-		const catalog = this.templateCatalog(ctx); const taskName = normalizeTaskName(params.task_name); const template = params.agent_type ? resolveAgentTemplate(catalog, params.agent_type) : undefined; if (template?.backend && template.backend !== params.backend) throw new Error(`Template ${template.name} requires backend=${template.backend}, but spawn_agent received backend=${params.backend}.`); if (template) validateTemplateBackendOptions(params.backend, template);
-		if (template?.scope === "project") { const canonicalCwd = realpathSync(cwd); if (!containedBy(canonicalCwd, catalog.projectRoot)) throw new Error("Project templates may only run inside their trusted project root."); }
-		const piSelection = params.backend === "pi" ? resolvePiSpawnSelection({ piModel: params.pi_model, piThinking: params.pi_thinking, template, parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined, parentThinking: this.pi.getThinkingLevel() as ThinkingLevel }) : undefined; if (piSelection) validatePiModelSelection(piSelection, (provider, modelId) => ctx.modelRegistry.find(provider, modelId)); const cursorModel = resolveCursorSpawnModel(params.backend, params.cursor_model, template);
-		const parent = this.parentSessionId(ctx); const manifest = this.manifest(parent); if (Object.values(manifest.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`); if (Object.values(manifest.agents).some((agent) => agent.taskName === taskName)) throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
-		const id = this.uuid(); const now = this.now(); const config = readJson<Config>(this.paths.configPath) ?? {};
+		validateSpawnPiOptions(params.backend, params);
+		const sourceCwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
+		if (!existsSync(sourceCwd) || !statSync(sourceCwd).isDirectory()) throw new Error(`Agent cwd is not a directory: ${sourceCwd}`);
+		const catalog = this.templateCatalog(ctx); const taskName = normalizeTaskName(params.task_name);
+		const template = params.agent_type ? resolveAgentTemplate(catalog, params.agent_type) : undefined;
+		if (template?.backend && template.backend !== params.backend) throw new Error(`Template ${template.name} requires backend=${template.backend}, but spawn_agent received backend=${params.backend}.`);
+		if (template) validateTemplateBackendOptions(params.backend, template);
+		if (template?.scope === "project" && !containedBy(realpathSync(sourceCwd), catalog.projectRoot)) throw new Error("Project templates may only run inside their trusted project root.");
+		const piSelection = params.backend === "pi" ? resolvePiSpawnSelection({ piModel: params.pi_model, piThinking: params.pi_thinking, template, parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined, parentThinking: this.pi.getThinkingLevel() as ThinkingLevel }) : undefined;
+		if (piSelection) validatePiModelSelection(piSelection, (provider, modelId) => ctx.modelRegistry.find(provider, modelId));
+		const cursorModel = resolveCursorSpawnModel(params.backend, params.cursor_model, template);
+		const parent = this.parentSessionId(ctx); const manifest = this.manifest(parent);
+		if (Object.values(manifest.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
+		if (Object.values(manifest.agents).some((agent) => agent.taskName === taskName)) throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
+		const id = this.uuid(); const turnId = this.uuid(); const collisionId = this.uuid(); const now = this.now(); const config = readJson<Config>(this.paths.configPath) ?? {};
 		const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined;
 		const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined;
 		const selectedSkills = params.backend === "pi" ? [...new Set([...(configuredSkills ?? []), ...(params.skills ?? [])])] : [];
@@ -909,40 +939,45 @@ class UnifiedManager {
 		const configuredPolicy: ResourceResolutionPolicy = { projectRoot: catalog.projectRoot, includeProject: template?.scope === "project" };
 		const explicitPolicy: ResourceResolutionPolicy = { projectRoot: catalog.projectRoot, includeProject: projectResourcesAllowed };
 		const configuredSkillSet = new Set(configuredSkills ?? []);
-		const skillPaths = selectedSkills.map((skill) => resolveSkillPath(skill, cwd, configuredSkillSet.has(skill) ? configuredPolicy : explicitPolicy));
-		const extensionPaths = (configuredExtensions ?? []).map((extension) => resolveExtensionPath(extension, cwd, configuredPolicy));
-		const proto: Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed"> = { id, taskName, canonicalName: `/${taskName}`, backend: params.backend, parentSessionId: parent, parentSessionFile: ctx.sessionManager.getSessionFile?.(), agentType: params.agent_type, cwd, model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL, provider: piSelection?.provider, modelId: piSelection?.modelId, thinking: piSelection?.thinking, tools: selectedTools, skills: selectedSkills, skillPaths, extensions: configuredExtensions ?? [], extensionPaths, cursorModel, permissionMode: normalizePermissionMode(params.permission_mode ?? template?.permissionMode), sessionFile: undefined, infoFile: "", logFile: "", responseFile: "", createdAt: now, updatedAt: now };
-		await this.ensurePrerequisites(params.backend, cwd);
-		const prompt = [template?.prompt, params.message].filter(Boolean).join("\n\n"); const turnId = this.uuid();
+		const skillPaths = selectedSkills.map((skill) => resolveSkillPath(skill, sourceCwd, configuredSkillSet.has(skill) ? configuredPolicy : explicitPolicy));
+		const extensionPaths = (configuredExtensions ?? []).map((extension) => resolveExtensionPath(extension, sourceCwd, configuredPolicy));
+		const defaultIsolation = config.defaults?.isolation === "worktree" || config.defaults?.isolation === "shared" ? config.defaults.isolation : undefined;
+		const isolation = params.isolation ?? template?.isolation ?? defaultIsolation ?? "shared";
+		await this.ensurePrerequisites(params.backend, sourceCwd);
+		let worktreePlan: ManagedWorktreePlan | undefined; let worktree: ManagedWorktreeState | undefined; let cwd = sourceCwd;
+		if (isolation === "worktree") {
+			worktreePlan = await planManagedWorktree({ sourceCwd, packageRoot: this.paths.root, scopeKey: parentScopeKey(parent), agentId: id, agentSlug: taskName, turnId, collisionId }, { commandRunner: this.commandRunner });
+			worktree = durableWorktree(worktreePlan, now); cwd = worktree.cwd;
+		}
+		const proto: Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed"> = { id, taskName, canonicalName: `/${taskName}`, backend: params.backend, parentSessionId: parent, parentSessionFile: ctx.sessionManager.getSessionFile?.(), agentType: params.agent_type, isolation, worktree, cwd, model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL, provider: piSelection?.provider, modelId: piSelection?.modelId, thinking: piSelection?.thinking, tools: selectedTools, skills: selectedSkills, skillPaths, extensions: configuredExtensions ?? [], extensionPaths, cursorModel, permissionMode: normalizePermissionMode(params.permission_mode ?? template?.permissionMode), sessionFile: undefined, infoFile: "", logFile: "", responseFile: "", createdAt: now, updatedAt: now };
+		const prompt = [template?.prompt, params.message].filter(Boolean).join("\n\n");
 		const queued = this.mutate(parent, (current) => {
 			if (Object.values(current.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
 			if (Object.values(current.agents).some((agent) => agent.taskName === taskName || agent.canonicalName === `/${taskName}`)) throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
-			let next = addAgentAtScope(current, this.store(parent).scopeDir, proto as any, now);
-			const agent = next.agents[id]!;
+			let next = addAgentAtScope(current, this.store(parent).scopeDir, proto, now); const agent = next.agents[id]!;
 			return enqueueTurn(next, { id: turnId, agentId: id, source: "initial", execution: this.execution(agent, prompt, params.message), createdAt: now, ownerEpoch: this.epoch });
 		});
 		let info = this.project(queued).find((entry) => entry.id === id)!;
 		try {
-			writePrivate(info.logFile, `${params.backend.toUpperCase()} subagent ${info.canonicalName}\nCwd: ${cwd}\nModel: ${info.model}\n\n`);
+			writePrivate(info.logFile, `${params.backend.toUpperCase()} subagent ${info.canonicalName}\nCwd: ${cwd}\nIsolation: ${isolation}\nModel: ${info.model}\n\n`);
 			this.initializeLedger(info); this.appendLedger(info, { kind: "runtime", state: "queued", detail: "turn queued" });
+			if (worktreePlan) {
+				await allocateManagedWorktree(worktreePlan, { commandRunner: this.commandRunner });
+				const active = this.mutate(parent, (current) => updateAgentWorktree(current, id, { phase: "active" }, this.now())); info = this.project(active).find((entry) => entry.id === id)!;
+				this.appendLedger(info, { kind: "phase", name: "Managed worktree ready", detail: info.worktree?.branch });
+			}
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			this.mutate(parent, (current) => transitionTurn(current, turnId, "terminal", this.now(), { status: "failed", reason: "spawn-preparation-failed", error: message }));
-			throw error;
+			const message = sanitizeTerminalText(error instanceof Error ? error.message : String(error), 500);
+			const failed = this.mutate(parent, (current) => { const at = this.now(); let next = current; if (next.agents[id]?.worktree?.phase === "planned") next = updateAgentWorktree(next, id, { phase: "failed", reason: "allocation-failed", error: message }, at); return transitionTurn(next, turnId, "terminal", at, { status: "failed", reason: "spawn-preparation-failed", error: message }); });
+			const failedInfo = this.project(failed).find((entry) => entry.id === id)!; this.appendLedger(failedInfo, { kind: "error", message }); this.appendLedger(failedInfo, { kind: "completion", status: "failed", summary: message }); throw error;
 		}
 		let createdViewer: { paneId: string; tabId: string } | undefined;
 		try {
 			createdViewer = await this.createViewer(info);
-			const updated = this.mutate(parent, (current) => updateAgentRuntimeResources(current, id, { viewerPaneId: createdViewer!.paneId, viewerTabId: createdViewer!.tabId }, this.now()));
-			info = this.project(updated).find((entry) => entry.id === id)!;
+			const updated = this.mutate(parent, (current) => updateAgentRuntimeResources(current, id, { viewerPaneId: createdViewer!.paneId, viewerTabId: createdViewer!.tabId }, this.now())); info = this.project(updated).find((entry) => entry.id === id)!;
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			if (createdViewer) await this.closeViewer({ ...info, viewerPaneId: createdViewer.paneId, viewerTabId: createdViewer.tabId }).catch(() => undefined);
-			try {
-				const failed = this.mutate(parent, (current) => transitionTurn(current, turnId, "terminal", this.now(), { status: "failed", reason: "viewer-create-failed", error: message }));
-				const failedInfo = this.project(failed).find((entry) => entry.id === id)!;
-				this.appendLedger(failedInfo, { kind: "error", message }); this.appendLedger(failedInfo, { kind: "completion", status: "failed", summary: message });
-			} catch { /* ownership may have changed; local viewer cleanup above is still required */ }
+			const message = error instanceof Error ? error.message : String(error); if (createdViewer) await this.closeViewer({ ...info, viewerPaneId: createdViewer.paneId, viewerTabId: createdViewer.tabId }).catch(() => undefined);
+			try { const failed = this.mutate(parent, (current) => transitionTurn(current, turnId, "terminal", this.now(), { status: "failed", reason: "viewer-create-failed", error: message })); const failedInfo = this.project(failed).find((entry) => entry.id === id)!; this.appendLedger(failedInfo, { kind: "error", message }); this.appendLedger(failedInfo, { kind: "completion", status: "failed", summary: message }); } catch {}
 			throw error;
 		}
 		const targets = this.defaultWaitTargets.get(parent) ?? new Set<string>(); targets.add(info.canonicalName); this.defaultWaitTargets.set(parent, targets); queueMicrotask(() => this.requestDrain(parent)); return info;
@@ -1071,6 +1106,26 @@ class UnifiedManager {
 	async close(parent: string, target: string): Promise<AgentStatus> {
 		const info = this.get(target, parent); return this.enqueueControl(info.id, () => this.closeNow(parent, target));
 	}
+	private async assertWorktreeReusable(info: AgentInfo): Promise<void> {
+		if (info.isolation !== "worktree") return;
+		if (!info.worktree || info.worktree.phase !== "active") throw new Error(`Managed worktree for ${info.canonicalName} is not active; inspect recovery metadata before continuing.`);
+		const classification = await classifyManagedWorktree(runtimeWorktree(info.worktree, info.id, parentScopeKey(info.parentSessionId), this.paths.root), { commandRunner: this.commandRunner });
+		if (!classification.owned || !classification.listed || ["inspection-uncertainty", "not-listed", "ownership", "symlink"].includes(classification.reason)) throw new Error(`Managed worktree for ${info.canonicalName} failed ownership verification; refusing follow-up.`);
+	}
+	private async finalizeWorktree(parent: string, info: AgentInfo): Promise<AgentInfo> {
+		const worktree = info.worktree; if (info.isolation !== "worktree" || !worktree || !["planned", "active", "failed"].includes(worktree.phase)) return info;
+		try {
+			const result = await finalizeManagedWorktree(runtimeWorktree(worktree, info.id, parentScopeKey(parent), this.paths.root), { commandRunner: this.commandRunner });
+			const dirty = result.classification.dirty; const common = { finalCommit: result.classification.head, finalBranch: result.classification.branch ?? undefined, changedFiles: dirty ? dirty.tracked + dirty.staged : undefined, untrackedFiles: dirty?.untracked };
+			const update = result.applied === "removed-path-and-branch" ? { phase: "removed" as const, reason: "clean-unchanged" as const, ...common }
+				: result.applied === "removed-path-retained-branch" ? { phase: "retained-branch" as const, reason: result.classification.reason === "clean-with-commits" ? "commits-preserved" as const : "cleanup-failed" as const, ...common }
+				: { phase: "retained-both" as const, reason: worktreeReason(result.classification)!, ...common };
+			const next = this.mutate(parent, (current) => updateAgentWorktree(current, info.id, update, this.now())); return this.project(next).find((entry) => entry.id === info.id)!;
+		} catch (error) {
+			const message = sanitizeTerminalText(error instanceof Error ? error.message : String(error), 300);
+			try { const next = this.mutate(parent, (current) => updateAgentWorktree(current, info.id, { phase: "retained-both", reason: "cleanup-failed", error: message }, this.now())); return this.project(next).find((entry) => entry.id === info.id)!; } catch { return info; }
+		}
+	}
 	private async sendNow(parent: string, target: string, message: string): Promise<{ delivery: "steer" | "cancel-and-prompt" | "prompt"; turnId: string }> {
 		const info = this.get(target, parent); const item = this.current(parent, info.id); const turn = item.turn; if (item.agent.closed) throw new Error(`Agent is closed: ${info.canonicalName}`); if (!turn) throw new Error(`Agent has no current turn: ${info.canonicalName}`); if (turn.state === "queued" || turn.state === "admitted") throw new Error(`Agent ${info.canonicalName} has a queued or admitted turn and cannot receive another message.`);
 		if (turn.state === "running") {
@@ -1091,6 +1146,7 @@ class UnifiedManager {
 			await this.launchAdmitted(parent, successor);
 			return { delivery: "cancel-and-prompt", turnId: successor };
 		}
+		await this.assertWorktreeReusable(info);
 		const id = this.uuid();
 		let next = this.mutate(parent, (current) => enqueueTurn(current, { id, agentId: info.id, source: "follow-up", execution: this.execution(current.agents[info.id]!, message, message), createdAt: this.now(), ownerEpoch: this.epoch }));
 		let updated = this.project(next).find((entry) => entry.id === info.id)!;
@@ -1142,9 +1198,10 @@ class UnifiedManager {
 		this.pushMail(this.completionEvent(updated)); this.scheduleIdleClose(updated); this.requestDrain(parent); return previous;
 	}
 	private async closeNow(parent: string, target: string): Promise<AgentStatus> {
-		const info = this.get(target, parent); const previous = info.status; if (previous === "closed") return previous;
-		const next = this.mutate(parent, (current) => closeManifestAgent(current, info.id, "agent-closed", this.now()));
-		const updated = this.project(next).find((entry) => entry.id === info.id)!; const live = this.live.get(info.id);
+		const info = this.get(target, parent); const previous = info.status; const recoverableClosed = previous === "closed" && (!!info.viewerPaneId || !!info.viewerTabId || info.isolation === "worktree" && !!info.worktree && ["planned", "active", "failed"].includes(info.worktree.phase)); if (previous === "closed" && !recoverableClosed) return previous;
+		let updated = info;
+		if (previous !== "closed") { const next = this.mutate(parent, (current) => closeManifestAgent(current, info.id, "agent-closed", this.now())); updated = this.project(next).find((entry) => entry.id === info.id)!; }
+		const live = this.live.get(info.id);
 		if (live) {
 			live.closing = true; live.pending = false; this.clearMetrics(live); this.flushThought(live); this.terminalizeActiveTools(live, "closed"); this.rejectApprovals(live, true, "agent closed");
 			try { if (live.kind === "pi") await live.pi!.abort(); else live.cursor!.cancel(); } catch {}
@@ -1152,8 +1209,12 @@ class UnifiedManager {
 			this.live.delete(info.id);
 		}
 		this.appendLedger(updated, { kind: "runtime", state: "closed" }); this.appendLedger(updated, { kind: "completion", status: "closed", summary: "agent closed" });
-		await this.closeViewer(updated).catch(() => undefined);
-		this.mutate(parent, (current) => updateAgentRuntimeResources(current, info.id, { viewerPaneId: null, viewerTabId: null }, this.now()));
+		let viewerClosed = true;
+		if (updated.viewerPaneId || updated.viewerTabId) { try { await this.closeViewer(updated); } catch { viewerClosed = false; } }
+		if (viewerClosed && (updated.viewerPaneId || updated.viewerTabId)) { const cleared = this.mutate(parent, (current) => updateAgentRuntimeResources(current, info.id, { viewerPaneId: null, viewerTabId: null }, this.now())); updated = this.project(cleared).find((entry) => entry.id === info.id)!; }
+		if (viewerClosed) updated = await this.finalizeWorktree(parent, updated);
+		else this.appendLedger(updated, { kind: "error", message: "Viewer cleanup failed; managed worktree retained for retry" });
+		if (updated.worktree) this.appendLedger(updated, { kind: "phase", name: "Worktree preservation", detail: `${updated.worktree.phase}${updated.worktree.reason ? ` · ${updated.worktree.reason}` : ""}` });
 		this.pushMail(this.completionEvent(updated), false); this.requestDrain(parent); return previous;
 	}
 
@@ -1426,6 +1487,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 	const Backend = StringEnum(["pi", "cursor"] as const, { description: "Required runtime backend. Choose explicitly." });
 	const PiThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Explicit Pi thinking level. Invalid for Cursor." });
 	const PermissionSchema = StringEnum(["agent", "prompt", "allow-once", "deny"] as const);
+	const IsolationSchema = StringEnum(["shared", "worktree"] as const, { description: "Filesystem isolation. Worktree requires a clean committed Git checkout." });
 	const SpawnSchema = Type.Object({
 		task_name: Type.String({ description: "Session-scoped task name; slash-separated names are allowed." }),
 		message: Type.String({ description: "Initial concrete task." }),
@@ -1437,6 +1499,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		pi_thinking: Type.Optional(PiThinkingSchema),
 		cursor_model: Type.Optional(Type.String({ description: "Cursor model string. Use list_subagent_models for exact supported values." })),
 		permission_mode: Type.Optional(PermissionSchema),
+		isolation: Type.Optional(IsolationSchema),
 	});
 	const TargetSchema = Type.Object({ target: Type.String({ description: "Session-owned agent task name." }) });
 
@@ -1449,6 +1512,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			"Always pass backend=pi or backend=cursor explicitly to spawn_agent; never infer a hidden default.",
 			"Before spawn_agent selects a non-inherited model, use list_subagent_models to discover exact backend-specific spawn values and thinking controls.",
 			"Before using agent_type, call list_agent_templates; project templates are available only when both Pi trust and the package trustedProjects allowlist approve the canonical project root.",
+			"Use isolation=worktree for an owned clean Git worktree. It rejects dirty source checkouts, never commits or merges, and preserves changed work on close for explicit user recovery.",
 			"For spawn_agent backend=pi, use pi_model in exact provider/model-id format and pi_thinking only when overriding template or parent defaults. Model and thinking each resolve as explicit spawn > template > parent.",
 			"Never pass pi_model or pi_thinking to spawn_agent backend=cursor; use cursor_model instead.",
 			"After spawn_agent, use wait_agent or wait_all_agents when the delegated result must block the current workflow; never sleep or poll.",
@@ -1466,6 +1530,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 				turn_id: info.currentTurnId,
 				turn_sequence: info.turnSequence,
 				model: info.model,
+				isolation: info.isolation,
+				...(info.worktree ? { worktree: { git_root: info.worktree.sourceRepoRoot, source_cwd: info.worktree.sourceCwd, worktree_root: info.worktree.worktreeRoot, cwd: info.worktree.cwd, branch: info.worktree.branch, base_commit: info.worktree.baseCommit, phase: info.worktree.phase, reason: info.worktree.reason ?? null } } : {}),
 				viewerPaneId: info.viewerPaneId,
 				viewerTabId: info.viewerTabId,
 				logFile: info.logFile,
@@ -1574,6 +1640,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 				backend: info.backend,
 				agent_status: info.status,
 				model: info.model,
+				isolation: info.isolation,
+				...(info.worktree ? { worktree: { branch: info.worktree.branch, worktree_root: info.worktree.worktreeRoot, cwd: info.worktree.cwd, base_commit: info.worktree.baseCommit, phase: info.worktree.phase, reason: info.worktree.reason ?? null, final_commit: info.worktree.finalCommit ?? null, final_branch: info.worktree.finalBranch ?? null, changed_files: info.worktree.changedFiles ?? null, untracked_files: info.worktree.untrackedFiles ?? null } } : {}),
 				current_activity: manager.currentActivity(info) ?? null,
 				activity_summary: manager.activitySummary(info),
 				elapsed: formatElapsed(info.createdAt),
@@ -1637,7 +1705,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		async execute(_id, params, _signal, _update, ctx) {
 			const parent = manager.parentSessionId(ctx); const previous = await manager.close(parent, params.target);
 			const info = manager.get(params.target, parent);
-			return textResult("Agent closed.", { target: params.target, previous_status: previous, status: info.status, turn_id: info.currentTurnId });
+			return textResult("Agent closed.", { target: params.target, previous_status: previous, status: info.status, turn_id: info.currentTurnId, isolation: info.isolation, ...(info.worktree ? { worktree: { branch: info.worktree.branch, worktree_root: info.worktree.worktreeRoot, phase: info.worktree.phase, reason: info.worktree.reason ?? null, final_commit: info.worktree.finalCommit ?? null, final_branch: info.worktree.finalBranch ?? null, changed_files: info.worktree.changedFiles ?? null, untracked_files: info.worktree.untrackedFiles ?? null } } : {}) });
 		},
 		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("close_agent ")) + theme.fg("accent", args.target), 0, 0); },
 		renderResult(result: any, _options, theme) { return new Text(theme.fg("success", `✓ previous: ${result.details?.previous_status}`), 0, 0); },

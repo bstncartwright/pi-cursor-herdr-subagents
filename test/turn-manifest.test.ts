@@ -7,7 +7,7 @@ import test from "node:test";
 import {
 	DEFAULT_ACTIVE_TURN_LIMIT, MAX_LOCK_BYTES, MAX_MANIFEST_BYTES, TURN_MANIFEST_FILE, TURN_MANIFEST_LOCK_FILE, TURN_MANIFEST_RECLAIM_FILE, TurnManifestStore,
 	addAgent, addAgentAtScope, admitFifo, canonicalAgentPaths, closeAgent, createParentManifest, enqueueTurn, materializeAgentProjections,
-	migrateLegacyInfo, parseParentManifest, reconcileManifest, replaceCursorTurn, touchTurn, transitionTurn, updateAgentRuntimeResources,
+	migrateLegacyInfo, parseParentManifest, reconcileManifest, replaceCursorTurn, touchTurn, transitionTurn, updateAgentRuntimeResources, updateAgentWorktree,
 	type AddAgentInput, type ResolvedExecutionSnapshot,
 } from "../extensions/turn-manifest.ts";
 
@@ -26,7 +26,7 @@ function seeded(count = 1, backend: "pi" | "cursor" = "pi") {
 	for (let index = 0; index < count; index++) { const input = agent(`agent-${index}`, backend); ids.push(input.id); manifest = addAgent(manifest, input, now); }
 	return { manifest, ids };
 }
-function queue(manifest: ReturnType<typeof createParentManifest>, agentId: string, id: string, backend: "pi" | "cursor" = "pi", createdAt = now) { return enqueueTurn(manifest, { id, agentId, source: "initial", execution: { ...execution(backend, id), sessionFile: manifest.agents[agentId]!.sessionFile }, createdAt, ownerEpoch: manifest.epoch }); }
+function queue(manifest: ReturnType<typeof createParentManifest>, agentId: string, id: string, backend: "pi" | "cursor" = "pi", createdAt = now) { return enqueueTurn(manifest, { id, agentId, source: "initial", execution: { ...execution(backend, id), cwd: manifest.agents[agentId]!.cwd, sessionFile: manifest.agents[agentId]!.sessionFile }, createdAt, ownerEpoch: manifest.epoch }); }
 
 function mutateJson(manifest: unknown, change: (value: any) => void) { const value = JSON.parse(JSON.stringify(manifest)); change(value); return value; }
 
@@ -34,7 +34,7 @@ test("manifest parsing is strict, versioned, corrupt-fail-closed, and contains n
 	let { manifest, ids } = seeded(); manifest = queue(manifest, ids[0]!, "turn-a");
 	assert.deepEqual(parseParentManifest(manifest), manifest);
 	for (const corrupt of [
-		mutateJson(manifest, (value) => { value.version = 3; }),
+		mutateJson(manifest, (value) => { value.version = 4; }),
 		mutateJson(manifest, (value) => { value.extra = true; }),
 		mutateJson(manifest, (value) => { value.turns["turn-a"].sequence = 0.1; }),
 		mutateJson(manifest, (value) => { value.agents[ids[0]].currentTurnId = "missing"; }),
@@ -340,13 +340,27 @@ test("store rejects oversized manifest and lock data before parsing", async () =
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("v1 upgrades to strict v2 and Pi-only metrics reject Cursor and payload fields", () => {
+test("v1/v2 upgrade to strict v3 and Pi-only metrics reject Cursor and payload fields", () => {
 	let { manifest, ids } = seeded(); manifest = queue(manifest, ids[0]!, "turn-a");
-	const v1: any = JSON.parse(JSON.stringify(manifest)); v1.version = 1;
+	const v2: any = JSON.parse(JSON.stringify(manifest)); v2.version = 2; for (const value of Object.values<any>(v2.agents)) delete value.isolation;
+	const upgradedV2 = parseParentManifest(v2); assert.equal(upgradedV2.version, 3); assert.equal(upgradedV2.agents[ids[0]!]!.isolation, "shared");
+	const v1: any = JSON.parse(JSON.stringify(v2)); v1.version = 1;
 	const upgraded = parseParentManifest(v1);
-	assert.equal(upgraded.version, 2);
+	assert.equal(upgraded.version, 3);
 	assert.throws(() => parseParentManifest({ ...v1, agents: { ...v1.agents, [ids[0]!]: { ...v1.agents[ids[0]!], metrics: {} } } }), /v1 manifest/);
+	assert.throws(() => parseParentManifest({ ...v2, agents: { ...v2.agents, [ids[0]!]: { ...v2.agents[ids[0]!], worktree: {} } } }), /v2 manifest/);
 	const metrics = { sampledAt: now, inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, cost: 0, contextUsage: { tokens: null, contextWindow: 100, percent: null }, compactionCount: 1 };
 	assert.doesNotThrow(() => parseParentManifest({ ...upgraded, agents: { ...upgraded.agents, [ids[0]!]: { ...upgraded.agents[ids[0]!], metrics } } }));
 	assert.throws(() => parseParentManifest({ ...upgraded, agents: { ...upgraded.agents, [ids[0]!]: { ...upgraded.agents[ids[0]!], metrics: { ...metrics, sessionId: "forbidden" } } } }), /unsupported/);
+});
+
+test("managed worktree identity is strict, projected, and lifecycle-updated narrowly", () => {
+	const id = "worktree-agent"; const worktree = { sourceRepoRoot: "/repo", sourceCwd: "/repo/packages/api", sourceSubdir: "packages/api", gitCommonDir: "/repo/.git", baseCommit: "a".repeat(40), sourceBranch: "main", branch: "pi-bstn/scope/worktree-agent-turn-uuid", worktreeRoot: "/managed/worktree-agent", cwd: "/managed/worktree-agent/packages/api", createdAt: now, phase: "planned" as const };
+	let manifest = createParentManifest(parent, "epoch-a", now); manifest = addAgent(manifest, { ...agent(id), isolation: "worktree", worktree, cwd: worktree.cwd }, now); manifest = queue(manifest, id, "worktree-turn");
+	assert.equal(materializeAgentProjections(manifest)[0]!.isolation, "worktree"); assert.deepEqual(materializeAgentProjections(manifest)[0]!.worktree, worktree);
+	manifest = updateAgentWorktree(manifest, id, { phase: "active" }, now + 1); manifest = updateAgentWorktree(manifest, id, { phase: "retained-both", reason: "dirty", finalCommit: "b".repeat(40), finalBranch: worktree.branch, changedFiles: 2, untrackedFiles: 1 }, now + 2);
+	assert.equal(manifest.agents[id]!.worktree!.reason, "dirty"); assert.throws(() => updateAgentWorktree(manifest, id, { phase: "removed", reason: "clean-unchanged" }, now + 3), /illegal worktree transition/);
+	assert.throws(() => parseParentManifest(mutateJson(manifest, (value) => { value.agents[id].cwd = "/repo"; value.turns["worktree-turn"].execution.cwd = "/repo"; })), /cwd must equal worktree cwd/);
+	assert.throws(() => parseParentManifest(mutateJson(manifest, (value) => { value.agents[id].worktree.branch = "user-owned"; })), /branch is not package-owned/);
+	assert.throws(() => parseParentManifest(mutateJson(manifest, (value) => { value.agents[id].isolation = "shared"; })), /must not have worktree/);
 });
