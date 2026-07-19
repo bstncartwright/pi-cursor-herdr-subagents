@@ -85,6 +85,13 @@ import type {
 import { PiRpcClient, JsonlDecoder, normalizePiCompactionEvent, normalizePiRpcToolEvent, type NormalizedBackendToolEvent } from "./pi-runtime.ts";
 import { formatWaitProgressRows, makeWaitProgress, waitProgressResult, type WaitProgressAgent } from "./wait-progress.ts";
 import {
+	buildCompletionFollowUpDetails,
+	renderCompletionMessage,
+	renderSpawnCall,
+	renderSpawnResult,
+	type CompletionRenderDetails,
+} from "./agent-message-render.ts";
+import {
 	TurnManifestStore, addAgentAtScope, admitFifo, closeAgent as closeManifestAgent, createParentManifest,
 	enqueueTurn, materializeAgentProjections, migrateLegacyInfo, reconcileManifest, replaceCursorTurn,
 	transitionTurn, touchTurn, updateAgentRuntimeResources, updateAgentMetrics, updateAgentWorktree,
@@ -1352,7 +1359,38 @@ class UnifiedManager {
 	private completionEvent(info: AgentInfo): MailEvent { return { id: this.uuid(), parentSessionId: info.parentSessionId, agentName: info.canonicalName, kind: "completion", status: info.status === "paused" ? "interrupted" : info.status, terminalReason: info.terminalReason, turnId: info.currentTurnId, finalResponse: info.finalResponse, error: info.error, createdAt: this.now() }; }
 	private pushMail(event: MailEvent, notifyParent = true): void { if (event.kind === "permission" && !this.isPermissionPending(event)) return; if (event.kind === "completion") this.mailbox.remove((old) => old.kind === "completion" && old.parentSessionId === event.parentSessionId && old.agentName === event.agentName); const index = this.waiters.findIndex((waiter) => waiter.parentSessionId === event.parentSessionId && (!waiter.targets || waiter.targets.has(event.agentName))); if (index >= 0) { this.waiters.splice(index, 1)[0]!.resolve(event); return; } this.mailbox.push(event); if (notifyParent && ![...this.waitAllScopes].some((scope) => scope.parentSessionId === event.parentSessionId && scope.targets.has(event.agentName))) this.notifyParent(event); }
 	private clearCompletionMail(parent: string, name: string): void { this.mailbox.remove((event) => event.kind === "completion" && event.parentSessionId === parent && event.agentName === name); }
-	private notifyParent(event: MailEvent): void { if (event.kind === "permission") { this.pi.sendMessage({ customType: "bstn_subagent_permission", content: `Cursor ACP subagent ${event.agentName} requires permission: ${event.summary}.`, display: true, details: { ...event } }, { triggerTurn: true, deliverAs: "followUp" }); return; } const info = this.get(event.agentName, event.parentSessionId); const output = boundedResult(event.finalResponse ?? event.error ?? "", info); this.pi.sendMessage({ customType: "bstn_subagent_completion", content: `Subagent ${event.agentName} [${info.backend}] reached ${event.status}.\n\n${output.text}`, display: true, details: { ...event, backend: info.backend, output: output.text, truncated: output.truncated, fullOutputPath: output.fullOutputPath } }, { triggerTurn: true, deliverAs: "followUp" }); }
+	private notifyParent(event: MailEvent): void {
+		if (event.kind === "permission") {
+			this.pi.sendMessage({ customType: "bstn_subagent_permission", content: `Cursor ACP subagent ${event.agentName} requires permission: ${event.summary}.`, display: true, details: { ...event } }, { triggerTurn: true, deliverAs: "followUp" });
+			return;
+		}
+		const info = this.get(event.agentName, event.parentSessionId);
+		const output = boundedResult(event.finalResponse ?? event.error ?? "", info);
+		const details = buildCompletionFollowUpDetails({
+			agentName: event.agentName,
+			mailStatus: event.status,
+			agentStatus: info.status,
+			terminalReason: event.terminalReason,
+			turnId: event.turnId,
+			backend: info.backend,
+			model: info.model,
+			thinking: info.backend === "pi" ? info.thinking : undefined,
+			isolation: info.isolation,
+			startedAt: info.startedAt,
+			createdAt: info.createdAt,
+			completedAt: info.completedAt,
+			metrics: info.backend === "pi" ? info.metrics : undefined,
+			output: output.text,
+			truncated: output.truncated,
+			fullOutputPath: output.fullOutputPath,
+		});
+		this.pi.sendMessage({
+			customType: "bstn_subagent_completion",
+			content: `Subagent ${event.agentName} [${info.backend}] reached ${event.status}.\n\n${output.text}`,
+			display: true,
+			details,
+		}, { triggerTurn: true, deliverAs: "followUp" });
+	}
 	readResponse(parent: string, target: string): { info: AgentInfo; response: string } {
 		const info = this.get(target, parent); const current = this.current(parent, info.id).turn;
 		return { info, response: FINAL.has(info.status) && current?.response ? this.response(current.response) ?? "" : "" };
@@ -1531,14 +1569,16 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 				turn_sequence: info.turnSequence,
 				model: info.model,
 				isolation: info.isolation,
+				...(info.backend === "pi" && info.thinking ? { thinking: info.thinking } : {}),
+				...(info.agentType ? { agent_type: info.agentType } : {}),
 				...(info.worktree ? { worktree: { git_root: info.worktree.sourceRepoRoot, source_cwd: info.worktree.sourceCwd, worktree_root: info.worktree.worktreeRoot, cwd: info.worktree.cwd, branch: info.worktree.branch, base_commit: info.worktree.baseCommit, phase: info.worktree.phase, reason: info.worktree.reason ?? null } } : {}),
 				viewerPaneId: info.viewerPaneId,
 				viewerTabId: info.viewerTabId,
 				logFile: info.logFile,
 			});
 		},
-		renderCall(args: SpawnParams, theme: any) { return new Text(`${theme.fg("toolTitle", theme.bold("spawn_agent "))}${theme.fg("accent", args.task_name ?? "?")}${theme.fg("dim", ` [${args.backend ?? "?"}]`)}`, 0, 0); },
-		renderResult(result: any, _options: any, theme: any) { return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ spawn failed" : `✓ ${result.details?.agent_name ?? "spawned"}`), 0, 0); },
+		renderCall(args: SpawnParams, theme: any) { return new Text(renderSpawnCall(args, theme), 0, 0); },
+		renderResult(result: any, _options: any, theme: any) { return new Text(renderSpawnResult(result, theme), 0, 0); },
 	};
 	pi.registerTool(spawnTool);
 
@@ -1807,16 +1847,9 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		});
 	}
 
-	pi.registerMessageRenderer("bstn_subagent_completion", (message, options, theme) => {
-		const details = message.details as { agentName?: string; backend?: string; status?: string; output?: string } | undefined;
-		const output = details?.output ?? String(message.content ?? "");
-		const lines = output.split("\n");
-		const visible = options.expanded ? lines : lines.slice(0, 10);
-		let text = `${theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(details?.agentName ?? "Subagent"))} ${theme.fg("dim", `[${details?.backend ?? "?"}] ${details?.status ?? "completed"}`)}`;
-		if (visible.length) text += `\n${visible.map((line) => theme.fg("customMessageText", line)).join("\n")}`;
-		if (!options.expanded && lines.length > visible.length) text += `\n${theme.fg("muted", `… ${lines.length - visible.length} more lines`)}`;
-		return new Text(text, 0, 0);
-	});
+	pi.registerMessageRenderer("bstn_subagent_completion", (message, options, theme) =>
+		new Text(renderCompletionMessage(message as { details?: CompletionRenderDetails | null; content?: unknown }, options, theme), 0, 0)
+	);
 	pi.registerMessageRenderer("bstn_subagent_permission", (message, _options, theme) =>
 		new Text(theme.fg("warning", String(message.content ?? "Cursor permission required")), 0, 0)
 	);

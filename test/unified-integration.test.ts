@@ -13,22 +13,32 @@ import type {
 	UnifiedSubagentDependencies, UnifiedTestObserver,
 } from "../extensions/unified-deps.ts";
 
-type Tool = { name: string; execute: (...args: any[]) => Promise<any> };
+type Tool = {
+	name: string;
+	execute: (...args: any[]) => Promise<any>;
+	renderCall?: (...args: any[]) => any;
+	renderResult?: (...args: any[]) => any;
+};
 type Listener = (...args: any[]) => unknown;
 
 function fakeApi() {
 	const tools = new Map<string, Tool>();
 	const lifecycle = new Map<string, Listener[]>();
+	const messageRenderers = new Map<string, (message: any, options: any, theme: any) => any>();
+	const sentMessages: Array<{ message: any; options?: any }> = [];
 	return {
 		tools,
+		messageRenderers,
+		sentMessages,
 		registerTool(tool: Tool) { tools.set(tool.name, tool); },
-		registerCommand() {}, registerMessageRenderer() {},
+		registerCommand() {},
+		registerMessageRenderer(type: string, renderer: (message: any, options: any, theme: any) => any) { messageRenderers.set(type, renderer); },
 		on(name: string, listener: Listener) { lifecycle.set(name, [...(lifecycle.get(name) ?? []), listener]); },
 		async emit(name: string, ...args: unknown[]) { for (const listener of lifecycle.get(name) ?? []) await listener(...args); },
 		getThinkingLevel() { return "low"; },
 		getActiveTools() { return ["read"]; },
 		getAllTools() { return [{ name: "read", sourceInfo: { source: "builtin" } }]; },
-		sendMessage() {},
+		sendMessage(message: any, options?: any) { sentMessages.push({ message, options }); },
 	} as any;
 }
 
@@ -385,4 +395,106 @@ test("completed compaction durably increments an existing sample when its refres
 		const metrics = observer.snapshot("parent-compaction").agents.find((agent) => agent.agentName === "/compact")?.metrics;
 		assert.equal(metrics?.compactionCount, 1); assert.equal(metrics?.totalTokens, 2);
 	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }
+});
+
+test("spawn and automatic completion message renderers use the redesign contracts", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-message-render-"));
+	const events: string[] = [];
+	const runtimes = new FakeRuntimes();
+	const api = fakeApi();
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, () => {}));
+	const ctx = context("parent-messages", root);
+	const theme = {
+		fg(color: string, text: string) { return `<${color}>${text}</${color}>`; },
+		bold(text: string) { return `*${text}*`; },
+	};
+	const textOf = (component: { render(width: number): string[] }) => component.render(200).join("\n");
+
+	try {
+		const spawn = api.tools.get("spawn_agent");
+		assert.ok(spawn?.renderCall && spawn.renderResult);
+		const call = textOf(spawn.renderCall!({
+			task_name: "alpha",
+			backend: "pi",
+			agent_type: "reviewer",
+			message: "SECRET_SPAWN_MESSAGE",
+		}, theme));
+		assert.match(call, /▸/);
+		assert.match(call, /\/alpha/);
+		assert.match(call, /\[pi\]/);
+		assert.match(call, /reviewer/);
+		assert.doesNotMatch(call, /SECRET_SPAWN_MESSAGE/);
+
+		const spawned = await execute(api, "spawn_agent", {
+			task_name: "alpha",
+			message: "SECRET_SPAWN_MESSAGE",
+			backend: "pi",
+			pi_thinking: "high",
+		}, ctx);
+		assert.equal(spawned.details.thinking, "high");
+		const queued = textOf(spawn.renderResult!({ isError: false, details: spawned.details }, {}, theme));
+		assert.match(queued, /Queued in background/);
+		assert.doesNotMatch(queued, /✓|SECRET_SPAWN_MESSAGE/);
+		assert.match(queued, /thinking high/);
+		const failed = textOf(spawn.renderResult!({ isError: true, content: [{ type: "text", text: "nope" }], details: { boom: true } }, {}, theme));
+		assert.match(failed, /✗ Spawn failed/);
+		assert.doesNotMatch(failed, /nope|boom|Queued/);
+
+		await turn();
+		runtimes.settlePi("/alpha", "visible completion output");
+		await turn();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		const completionSend = api.sentMessages.find((entry: { message: any; options?: any }) => entry.message?.customType === "bstn_subagent_completion");
+		assert.ok(completionSend, "automatic completion follow-up was sent");
+		assert.equal(
+			completionSend.message.content,
+			"Subagent /alpha [pi] reached completed.\n\nvisible completion output",
+		);
+		const details = completionSend.message.details as Record<string, unknown>;
+		const allowed = new Set([
+			"agentName", "backend", "status", "agentStatus", "terminalReason", "turnId", "model",
+			"thinking", "isolation", "durationMs", "metrics", "output", "truncated", "fullOutputPath",
+		]);
+		for (const key of Object.keys(details)) assert.ok(allowed.has(key), `unexpected detail key ${key}`);
+		for (const key of ["id", "parentSessionId", "createdAt", "finalResponse", "error", "lastTaskMessage", "logFile", "worktree", "cwd", "approvalId", "message", "prompt"]) {
+			assert.equal(Object.hasOwn(details, key), false, key);
+		}
+		assert.equal(details.agentName, "/alpha");
+		assert.equal(details.status, "completed");
+		assert.equal(details.agentStatus, "completed");
+		assert.equal(details.output, "visible completion output");
+		assert.equal(details.thinking, "high");
+		assert.equal(typeof details.durationMs, "number");
+
+		const renderer = api.messageRenderers.get("bstn_subagent_completion");
+		assert.ok(renderer);
+		const collapsed = textOf(renderer(completionSend.message, { expanded: false }, theme));
+		assert.match(collapsed, /✓/);
+		assert.match(collapsed, /\/alpha/);
+		assert.match(collapsed, /completed/);
+		assert.match(collapsed, /visible completion output/);
+		assert.doesNotMatch(collapsed, /SECRET_SPAWN_MESSAGE|parentSessionId|finalResponse/);
+
+		await execute(api, "spawn_agent", {
+			task_name: "cursor-msg",
+			message: "cursor secret",
+			backend: "cursor",
+			cursor_model: "Auto",
+		}, ctx);
+		await turn();
+		await execute(api, "interrupt_agent", { target: "cursor-msg" }, ctx);
+		await turn();
+		const cursorSend = api.sentMessages.filter((entry: { message: any; options?: any }) => entry.message?.customType === "bstn_subagent_completion").at(-1);
+		assert.ok(cursorSend);
+		assert.equal(cursorSend.message.details.backend, "cursor");
+		assert.equal(Object.hasOwn(cursorSend.message.details, "thinking"), false);
+		assert.equal(Object.hasOwn(cursorSend.message.details, "metrics"), false);
+		const cursorRendered = textOf(renderer(cursorSend.message, { expanded: false }, theme));
+		assert.match(cursorRendered, /usage —/);
+		assert.doesNotMatch(cursorRendered, /thinking/);
+	} finally {
+		await api.emit("session_shutdown");
+		await rm(root, { recursive: true, force: true });
+	}
 });
