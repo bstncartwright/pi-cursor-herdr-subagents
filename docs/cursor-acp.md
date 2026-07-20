@@ -64,13 +64,21 @@ not display Pi's `turn N/M` metric in widgets, inline results, or notifications.
 ## Model selection
 
 There is no static model catalog in this package. Before selecting a model, a
-parent session calls `list_subagent_models({ backend: "cursor" })`. The tool
-opens one disposable ACP client/session. The discovery client advertises no MCP
-servers or client-provided ACP filesystem/terminal capabilities and sends no
-prompt; it reads the advertised model config, then closes in `finally`. Its
-output preserves ACP option groups and shows each exact value, display name,
-current selection, and copyable spawn syntax. This is not a sandbox: the Cursor
-subprocess runs in the chosen cwd with the invoking user's permissions.
+parent session calls `list_subagent_models({ backend: "cursor", query: "<name>" })`
+when it knows the intended Cursor display name, or browses without `query` to
+scan choices. The tool opens one disposable ACP client/session. The discovery
+client advertises no MCP servers or client-provided ACP filesystem/terminal
+capabilities and sends no prompt; it reads the advertised model config, then
+closes in `finally`.
+
+Compact tool output stays small: browse shows Cursor display names only and,
+when Cursor is included or Pi is truncated, hints with concrete
+`list_subagent_models({ backend: "cursor", query: "<name>" })` or
+`list_subagent_models({ backend: "pi", query: "<name>" })` calls; lookup
+returns `name → exact value` matches plus one shared spawn hint. Expanded TUI
+rendering (`details`) preserves full catalogs with exact values, current
+selection, and ACP option groups. This is not a sandbox: the Cursor subprocess
+runs in the chosen cwd with the invoking user's permissions.
 
 `cursor_model` is resolved against the configuration returned by the active
 Cursor version. Invalid values fail with the currently advertised choices.
@@ -81,9 +89,10 @@ after session/process cleanup rather than waiting for ACP request timeouts.
 
 An explicit `model` value always targets the default Pi backend. When that
 lookup fails and the intended model may be a Cursor display name, the spawn
-boundary tells the caller to list live Cursor values, then retry with
-`backend: "cursor"` and `cursor_model: "<advertised value>"`, omitting Pi-only
-`model`, `thinking`, and `max_turns` fields.
+boundary tells the caller to list live Cursor values with
+`list_subagent_models({ backend: "cursor", query: "<intended name>" })`, then
+retry with `backend: "cursor"` and `cursor_model: "<exact value>"`, omitting
+Pi-only `model`, `thinking`, and `max_turns` fields.
 
 After `session/new`, `session/load`, or `session/resume` (and after an optional
 model config update), the final advertised model option's `currentValue` is

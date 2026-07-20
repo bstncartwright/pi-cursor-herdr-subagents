@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import { CursorAcpClient, findCursorModelOption } from "#src/cursor/acp-client";
 import { discoverCursorModels } from "#src/cursor/discover-cursor-models";
+import { ListSubagentModelsTool } from "#src/tools/list-subagent-models-tool";
 
 const live = process.env.CURSOR_ACP_LIVE === "1" ? it : it.skip;
 
@@ -32,9 +33,29 @@ live("prompts the installed Cursor CLI over ACP", { timeout: 120_000 }, async ()
   }
 });
 
-live("discovers live Cursor ACP model values without prompting", { timeout: 60_000 }, async () => {
+live("discovers live Cursor ACP values and keeps model output compact", { timeout: 120_000 }, async () => {
   const models = await discoverCursorModels({ cwd: process.cwd() });
 
   expect(models.length).toBeGreaterThan(0);
   expect(models.some((model) => model.value.length > 0 && model.name.length > 0)).toBe(true);
+
+	// Reuse the one live discovery result so this smoke verifies formatting without
+	// opening multiple extra ACP sessions (which can trigger Cursor startup throttling).
+	const tool = new ListSubagentModelsTool({ discoverCursorModels: async () => models });
+	const ctx = { cwd: process.cwd(), modelRegistry: undefined } as never;
+	const browse = await tool.execute({ backend: "cursor" }, undefined, ctx);
+	const browseText = browse.content[0]?.text ?? "";
+	const current = browse.details?.cursor?.models.find((model) => model.current)
+		?? browse.details?.cursor?.models[0];
+
+	expect(current).toBeDefined();
+	expect(browseText.length).toBeLessThan(1_500);
+	for (const model of browse.details?.cursor?.models ?? []) {
+		if (model.value !== model.name) expect(browseText).not.toContain(model.value);
+	}
+
+	const lookup = await tool.execute({ backend: "cursor", query: current!.name }, undefined, ctx);
+	const lookupText = lookup.content[0]?.text ?? "";
+	expect(lookupText).toContain(current!.value);
+	expect(lookupText.match(/subagent\(/g)).toHaveLength(1);
 });

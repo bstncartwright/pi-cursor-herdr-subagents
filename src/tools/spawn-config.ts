@@ -199,5 +199,5 @@ export function resolveSpawnConfig(
  * Pi `model` override (for example, "Auto").
  */
 function withCursorModelRetryGuidance(error: string): string {
-  return `${error}\n\nThe default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor" }) to discover its live advertised values. Then retry with subagent({ backend: "cursor", cursor_model: "<advertised value>", subagent_type: "general-purpose", prompt: "...", description: "..." }). Omit model, thinking, and max_turns.`;
+  return `${error}\n\nThe default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor", query: "<intended name>" }) to resolve its live exact value. Then retry with subagent({ backend: "cursor", cursor_model: "<exact value>", subagent_type: "general-purpose", prompt: "...", description: "..." }). Omit model, thinking, and max_turns.`;
 }

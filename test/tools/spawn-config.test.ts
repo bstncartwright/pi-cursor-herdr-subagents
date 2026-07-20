@@ -151,10 +151,10 @@ describe("resolveSpawnConfig — model resolution", () => {
       defaultSettings,
     );
     expect(result).toEqual({
-      error: expect.stringContaining('The default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor" })'),
+      error: expect.stringContaining('The default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor", query: "<intended name>" })'),
     });
     if ("error" in result) {
-      expect(result.error).toContain('subagent({ backend: "cursor", cursor_model: "<advertised value>"');
+      expect(result.error).toContain('subagent({ backend: "cursor", cursor_model: "<exact value>"');
       expect(result.error).toContain("Omit model, thinking, and max_turns.");
     }
   });

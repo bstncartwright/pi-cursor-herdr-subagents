@@ -72,7 +72,7 @@ Discover the live Cursor values first; Cursor's display names are not a stable
 package catalog:
 
 ```text
-list_subagent_models({ backend: "cursor" })
+list_subagent_models({ backend: "cursor", query: "Composer" })
 ```
 
 ```text
@@ -86,11 +86,12 @@ subagent({
 })
 ```
 
-`cursor_model` is optional. When provided, copy the advertised `value` exactly;
-the tool also shows an exact Cursor spawn call. The extension does not maintain
-a hard-coded Cursor model list. When omitted, Cursor's actual ACP current value
-is captured after session creation and shown as the resolved model; the UI never
-claims a fabricated `default` model while that session is still being negotiated.
+`cursor_model` is optional. When provided, copy the advertised exact `value` from
+lookup output; browse mode shows Cursor display names only. The extension does
+not maintain a hard-coded Cursor model list. When omitted, Cursor's actual ACP
+current value is captured after session creation and shown as the resolved
+model; the UI never claims a fabricated `default` model while that session is
+still being negotiated.
 
 ## UI
 
@@ -242,18 +243,30 @@ If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, or `r
 
 ### `list_subagent_models`
 
-Discover models before setting `model` or `cursor_model`. Omit `backend` to
-list both authenticated/available Pi models and live Cursor ACP choices.
+Discover models before setting `model` or `cursor_model`. Prefer lookup with
+`query` over unfiltered browse. Omit `backend` to include both authenticated Pi
+models and live Cursor ACP choices.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `backend` | string | no | `pi` or `cursor`; omit for both |
+| `query` | string | no | Case-insensitive lookup by Pi provider/id or display name, or Cursor display name or exact value |
+| `limit` | integer | no | Max models per backend section in browse or lookup. Default 10, max 20 |
+
+Browse mode (omit `query`) returns compact sections: Pi lists exact
+`provider/id` values; Cursor lists display names only and marks the current
+choice compactly. When Cursor is included or a section is truncated, the output
+hints to call again with `backend` + `query` for exact values.
+
+Lookup mode returns capped `name → exact value` lines per backend (up to `limit`
+Pi matches plus up to `limit` Cursor matches) plus one shared spawn hint. Full
+match totals remain in `details`. Zero matches returns `0 matches of N` with
+guidance to broaden or browse.
 
 Cursor discovery opens one disposable ACP session, sends no prompt, and closes
-it before returning. The output includes each ACP `name`, exact `value`, current
-selection, and a copyable `subagent({ backend: "cursor", cursor_model: ... })`
-call. If Cursor discovery fails in an unfiltered call, available Pi models are
-still returned with a warning.
+it before returning. Expanded TUI view (`details`) includes full catalogs with
+Cursor exact values, current selection, and groups. If Cursor discovery fails in
+an unfiltered call, available Pi models are still returned with a warning.
 
 ### `subagent`
 

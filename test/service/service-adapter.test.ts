@@ -259,10 +259,10 @@ describe("SubagentsServiceAdapter — spawn", () => {
     );
 
     expect(() => svc.spawn("Explore", "task", { model: "Auto" })).toThrow(
-      /The default Pi backend was searched\. If you intended a Cursor model, call list_subagent_models\(\{ backend: "cursor" \}\)/,
+      /The default Pi backend was searched\. If you intended a Cursor model, call list_subagent_models\(\{ backend: "cursor", query: "<intended name>" \}\)/,
     );
     expect(() => svc.spawn("Explore", "task", { model: "Auto" })).toThrow(
-      /backend: "cursor", cursorModel: "<advertised value>".*Omit model, thinkingLevel, and maxTurns/s,
+      /backend: "cursor", cursorModel: "<exact value>".*Omit model, thinkingLevel, and maxTurns/s,
     );
   });
 

@@ -155,7 +155,7 @@ export class AgentTool {
 
 		const guidelines = [
 			"- For parallel work, use run_in_background: true on each agent. Foreground calls run sequentially — only one executes at a time.",
-			"- Before choosing model or cursor_model, call list_subagent_models; do not guess Cursor model values.",
+			"- Before choosing cursor_model, call list_subagent_models({ backend: \"cursor\", query: \"<name>\" }); do not guess Cursor values. Reuse returned exact values instead of rediscovering each Cursor spawn.",
 			'- Use backend: "cursor" only when Cursor ACP execution is intended; Pi remains the default.',
 			"- For Cursor, use cursor_model and permission_mode. Pi model, thinking, and max_turns fields do not apply.",
 			...this.agentGuidelines,

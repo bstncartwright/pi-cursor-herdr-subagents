@@ -122,7 +122,7 @@ export class SubagentsServiceAdapter implements SubagentsService {
 
 /** Keep the public service API unchanged while making a common backend mix-up actionable. */
 function withCursorModelRetryGuidance(error: string): string {
-  return `${error}\n\nThe default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor" }) to discover its live advertised values. Then retry spawn() with { backend: "cursor", cursorModel: "<advertised value>" }. Omit model, thinkingLevel, and maxTurns.`;
+  return `${error}\n\nThe default Pi backend was searched. If you intended a Cursor model, call list_subagent_models({ backend: "cursor", query: "<intended name>" }) to resolve its live exact value. Then retry spawn() with { backend: "cursor", cursorModel: "<exact value>" }. Omit model, thinkingLevel, and maxTurns.`;
 }
 
 /**
