@@ -6,6 +6,6 @@ export default function captureParentTools(pi: ExtensionAPI): void {
 		const path = process.env.PI_TEST_TOOL_CAPTURE;
 		if (!path) return;
 		const tools = pi.getAllTools().map((tool) => ({ name: tool.name, parameters: tool.parameters ?? null, source: tool.sourceInfo?.source ?? null }));
-		writeFileSync(path, `${JSON.stringify({ tools })}\n`, { mode: 0o600 });
+		writeFileSync(path, `${JSON.stringify({ tools, activeTools: pi.getActiveTools() })}\n`, { mode: 0o600 });
 	});
 }

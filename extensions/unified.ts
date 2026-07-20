@@ -82,8 +82,9 @@ import type {
 	CommandResult, CommandRunner, CursorRuntime, HerdrAgent, HerdrOperations, PiRuntime, PiSessionStats,
 	ManagerStateListener, ManagerStateSnapshot, PiRuntimeAgent, UnifiedStoragePaths, UnifiedSubagentDependencies, UnifiedTestObserver,
 } from "./unified-deps.ts";
-import { PiRpcClient, JsonlDecoder, normalizePiCompactionEvent, normalizePiRpcToolEvent, type NormalizedBackendToolEvent } from "./pi-runtime.ts";
-import { formatWaitProgressRows, makeWaitProgress, waitProgressResult, type WaitProgressAgent } from "./wait-progress.ts";
+import { PI_EXTENSION_STARTUP_FAILURE, PiRpcClient, JsonlDecoder, normalizePiCompactionEvent, normalizePiRpcToolEvent, type NormalizedBackendToolEvent } from "./pi-runtime.ts";
+import { CODEX_CONVERSION_PACKAGE, resolveInstalledCodexExtension } from "./codex-extension-resolver.ts";
+import { makeWaitProgress, waitProgressResult, type WaitProgressAgent } from "./wait-progress.ts";
 import {
 	buildCompletionFollowUpDetails,
 	renderCompletionMessage,
@@ -92,9 +93,14 @@ import {
 	type CompletionRenderDetails,
 } from "./agent-message-render.ts";
 import {
+	renderAgentsCall, renderAgentsResult, renderCloseResult, renderInterruptResult, renderModelsCall, renderModelsResult,
+	renderPermissionCall, renderPermissionCard, renderPermissionResult, renderReadResult, renderSendResult,
+	renderTargetCall, renderTemplatesCall, renderTemplatesResult, renderWaitAllCall, renderWaitAllResult, renderWaitCall, renderWaitResult,
+} from "./agent-tool-render.ts";
+import {
 	TurnManifestStore, addAgentAtScope, admitFifo, closeAgent as closeManifestAgent, createParentManifest,
-	enqueueTurn, materializeAgentProjections, migrateLegacyInfo, reconcileManifest, replaceCursorTurn,
-	transitionTurn, touchTurn, updateAgentRuntimeResources, updateAgentMetrics, updateAgentWorktree,
+	enqueueTurn, materializeAgentProjections, migrateLegacyInfo, normalizeSettledPiAgentExtensions, reconcileManifest, replaceCursorTurn,
+	transitionTurn, touchTurn, incrementAgentToolCallCount, updateAgentRuntimeResources, updateAgentMetrics, updateAgentWorktree,
 	type AgentMetrics, type IsolationMode, type ManagedWorktreeState, type ManifestAgent, type ManifestTurn, type ParentManifestV1, type ResolvedExecutionSnapshot,
 } from "./turn-manifest.ts";
 export { JsonlDecoder, normalizePiCompactionEvent, normalizePiRpcToolEvent };
@@ -116,7 +122,10 @@ const PRODUCTION_PATHS: UnifiedStoragePaths = {
 	cursorConfigPath: CURSOR_CONFIG_PATH,
 };
 const MAX_AGENTS = 8;
-const DEFAULT_PI_TOOLS = "read,bash,grep,find,ls";
+// Keep Pi's editing primitives available when the parent harness exposes only custom tool names.
+const DEFAULT_PI_TOOLS = "read,write,edit,bash,grep,find,ls";
+const CODEX_CHILD_GUARD_NAME = "pi-bstn-codex-child-guard";
+const CODEX_CHILD_GUARD_PATH = realpathSync(fileURLToPath(new URL("./codex-child-guard.ts", import.meta.url)));
 const PERMISSION_TIMEOUT_MS = 120_000;
 const CURSOR_CANCEL_TIMEOUT_MS = 2_000;
 export const SUBAGENT_IDLE_CLOSE_MS = 15 * 60 * 1000;
@@ -178,6 +187,7 @@ export interface AgentInfo {
 	currentTurnId?: string;
 	turnSequence?: number;
 	terminalReason?: string;
+	toolCallCount: number;
 	metrics?: AgentMetrics;
 }
 
@@ -220,14 +230,22 @@ export function formatElapsed(startedAt: number, now = Date.now()): string {
 	return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
+/** Compact elapsed format for the persistent widget only. */
+export function formatWidgetElapsed(startedAt: number, now = Date.now()): string {
+	const seconds = Math.max(0, Math.floor((now - startedAt) / 1_000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60); const remainder = seconds % 60;
+	if (minutes < 60) return `${minutes}m${remainder}s`;
+	const hours = Math.floor(minutes / 60); return `${hours}h${String(minutes % 60).padStart(2, "0")}m${remainder}s`;
+}
+
 export function formatPersistentWidgetMetadata(
-	info: Pick<AgentInfo, "backend" | "model" | "thinking" | "status" | "createdAt">,
+	info: Pick<AgentInfo, "backend" | "model" | "thinking" | "status" | "createdAt"> & { toolCallCount?: number },
 	now = Date.now(),
 ): string {
-	const parts = [`[${info.backend}] ${info.model}`];
-	if (info.backend === "pi") parts.push(`thinking ${info.thinking ?? "unknown"}`);
-	parts.push(info.status, formatElapsed(info.createdAt, now));
-	return parts.join(" · ");
+	const model = info.backend === "pi" ? `${info.model}:${info.thinking ?? "unknown"}` : info.model;
+	const count = typeof info.toolCallCount === "number" && Number.isSafeInteger(info.toolCallCount) && info.toolCallCount >= 0 ? info.toolCallCount : 0;
+	return `${model} · ${info.status} · ${formatWidgetElapsed(info.createdAt, now)} · ${count} tool call${count === 1 ? "" : "s"}`;
 }
 
 export function compactActivityText(value: string | undefined, maxCodePoints = 120): string {
@@ -290,6 +308,8 @@ interface RuntimeHandle {
 	queuedCursorMessage?: string;
 	phase: string;
 	activeTools: Map<string, string>;
+	/** Accepted tool starts are one-shot within this immutable turn handle. */
+	seenToolStartIds: Set<string>;
 	/** Raw thought chunks exist only in this short-lived memory buffer. */
 	thoughtChunks: number;
 	thoughtCharacters: number;
@@ -448,6 +468,27 @@ function stringList(value: unknown): string[] | undefined {
 	return result.length ? [...new Set(result)] : undefined;
 }
 
+function isCodexProvider(backend: AgentBackend, provider: string | undefined): boolean {
+	return backend === "pi" && provider === "openai-codex";
+}
+
+/** Keep persisted extension names and paths aligned while preserving selected extension order. */
+export function codexExtensionPairs(names: string[], paths: string[], conversionRoot: string): { names: string[]; paths: string[] } {
+	if (names.length !== paths.length) throw new Error("Codex child has misaligned persisted extension configuration.");
+	const selected = names.map((name, index) => ({ name, path: paths[index]! })).filter((pair) =>
+		pair.name !== CODEX_CONVERSION_PACKAGE && pair.path !== conversionRoot
+		&& pair.name !== CODEX_CHILD_GUARD_NAME && pair.path !== CODEX_CHILD_GUARD_PATH,
+	);
+	return { names: [CODEX_CONVERSION_PACKAGE, ...selected.map((pair) => pair.name), CODEX_CHILD_GUARD_NAME], paths: [conversionRoot, ...selected.map((pair) => pair.path), CODEX_CHILD_GUARD_PATH] };
+}
+
+function isCanonicalCodexConfiguration(agent: ManifestAgent, conversionRoot: string): boolean {
+	if (agent.tools !== undefined || agent.extensions.length !== agent.extensionPaths.length || agent.extensions.length < 2) return false;
+	const last = agent.extensions.length - 1;
+	if (agent.extensions[0] !== CODEX_CONVERSION_PACKAGE || agent.extensionPaths[0] !== conversionRoot || agent.extensions[last] !== CODEX_CHILD_GUARD_NAME || agent.extensionPaths[last] !== CODEX_CHILD_GUARD_PATH) return false;
+	return agent.extensions.slice(1, -1).every((name, index) => name !== CODEX_CONVERSION_PACKAGE && name !== CODEX_CHILD_GUARD_NAME && agent.extensionPaths[index + 1] !== conversionRoot && agent.extensionPaths[index + 1] !== CODEX_CHILD_GUARD_PATH);
+}
+
 export function selectInheritedPiTools(
 	activeNames: string[],
 	allTools: Array<{ name: string; sourceInfo?: { source?: string } }>,
@@ -578,12 +619,13 @@ function log(info: Pick<AgentInfo, "logFile">, category: string, message: string
 	}
 }
 
-function boundedResult(text: string, info: AgentInfo): { text: string; truncated: boolean; fullOutputPath?: string } {
+function boundedResult(text: string, info: AgentInfo): { text: string; displayText: string; truncated: boolean; fullOutputPath?: string } {
 	const result = truncateHead(text || "(no final response)", { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
-	if (!result.truncated) return { text: result.content, truncated: false };
+	if (!result.truncated) return { text: result.content, displayText: result.content, truncated: false };
 	writePrivate(info.responseFile, text);
 	return {
 		text: `${result.content}\n\n[Output truncated: ${result.outputLines}/${result.totalLines} lines, ${formatSize(result.outputBytes)}/${formatSize(result.totalBytes)}. Full response: ${info.responseFile}]`,
+		displayText: result.content,
 		truncated: true,
 		fullOutputPath: info.responseFile,
 	};
@@ -705,6 +747,7 @@ class UnifiedManager {
 	private readonly herdr?: HerdrOperations;
 	private readonly createPiRuntime: NonNullable<UnifiedSubagentDependencies["createPiRuntime"]>;
 	private readonly createCursorRuntime: NonNullable<UnifiedSubagentDependencies["createCursorRuntime"]>;
+	private readonly resolveCodexExtension: NonNullable<UnifiedSubagentDependencies["resolveCodexExtension"]>;
 	private readonly stateListeners = new Map<string, Set<ManagerStateListener>>();
 	private readonly lastSnapshots = new Map<string, string>();
 	private readonly stores = new Map<string, TurnManifestStore>();
@@ -734,6 +777,7 @@ class UnifiedManager {
 		this.commandRunner = dependencies.commandRunner ?? runCommand; this.herdr = dependencies.herdr;
 		this.createPiRuntime = dependencies.createPiRuntime ?? ((info, handlers) => new PiRpcClient(info, handlers.onEvent, handlers.onExit, (category, message) => log(info, category, message)));
 		this.createCursorRuntime = dependencies.createCursorRuntime ?? ((cwd, handlers) => new CursorAcpClient(cwd, handlers));
+		this.resolveCodexExtension = dependencies.resolveCodexExtension ?? resolveInstalledCodexExtension;
 		this.parentSeq = this.now() * 1000; this.ledgerSeq = this.now() * 1000;
 		ensureDir(this.paths.root); ensureDir(this.paths.agentsDir); ensureDir(runsDir(this.paths));
 	}
@@ -824,7 +868,7 @@ class UnifiedManager {
 
 	snapshot(parentSessionId: string): ManagerStateSnapshot {
 		const infos = this.readScope(parentSessionId); const queued = infos.filter((info) => info.status === "queued").sort((a, b) => (a.turnSequence ?? 0) - (b.turnSequence ?? 0));
-		return { parentSessionId, agents: infos.map((info) => { const live = this.live.get(info.id); return { id: info.id, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.backend === "pi" ? info.thinking : undefined, status: info.status, createdAt: info.createdAt, updatedAt: info.updatedAt, startedAt: info.startedAt, completedAt: info.completedAt, closedAt: info.closedAt, lastActivityAt: info.lastActivity, activity: this.currentActivity(info) ? compactActivityText(this.currentActivity(info), 120) : null, turnId: info.currentTurnId, turnSequence: info.turnSequence, turnOrdinal: info.turn, terminalReason: info.terminalReason, queuePosition: info.status === "queued" ? queued.findIndex((entry) => entry.id === info.id) + 1 : undefined, permissionPending: !!live && (live.promptPermissionPending || live.pendingApprovals.size > 0), ledgerRevision: this.ledgerRevisions.get(info.id) ?? 0, metrics: info.backend === "pi" && info.metrics ? { ...info.metrics, ...(info.metrics.contextUsage ? { contextUsage: { ...info.metrics.contextUsage } } : {}) } : undefined }; }) };
+		return { parentSessionId, agents: infos.map((info) => { const live = this.live.get(info.id); return { id: info.id, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.backend === "pi" ? info.thinking : undefined, status: info.status, createdAt: info.createdAt, updatedAt: info.updatedAt, startedAt: info.startedAt, completedAt: info.completedAt, closedAt: info.closedAt, lastActivityAt: info.lastActivity, activity: this.currentActivity(info) ? compactActivityText(this.currentActivity(info), 120) : null, turnId: info.currentTurnId, turnSequence: info.turnSequence, turnOrdinal: info.turn, terminalReason: info.terminalReason, toolCallCount: info.toolCallCount, queuePosition: info.status === "queued" ? queued.findIndex((entry) => entry.id === info.id) + 1 : undefined, permissionPending: !!live && (live.promptPermissionPending || live.pendingApprovals.size > 0), ledgerRevision: this.ledgerRevisions.get(info.id) ?? 0, metrics: info.backend === "pi" && info.metrics ? { ...info.metrics, ...(info.metrics.contextUsage ? { contextUsage: { ...info.metrics.contextUsage } } : {}) } : undefined }; }) };
 	}
 	subscribe(parent: string, listener: ManagerStateListener): () => void {
 		const listeners = this.stateListeners.get(parent) ?? new Set<ManagerStateListener>();
@@ -856,7 +900,7 @@ class UnifiedManager {
 			id: info.id, agentName: info.canonicalName, backend: info.backend, model: info.model, thinking: info.backend === "pi" ? info.thinking : undefined,
 			status: info.status, createdAt: info.createdAt, updatedAt: info.updatedAt, startedAt: info.startedAt, completedAt: info.completedAt, closedAt: info.closedAt,
 			lastActivityAt: info.lastActivity, activity: null, turnId: info.currentTurnId, turnSequence: info.turnSequence, turnOrdinal: info.turn,
-			terminalReason: info.terminalReason, permissionPending: false, ledgerRevision: 0,
+			terminalReason: info.terminalReason, toolCallCount: info.toolCallCount, permissionPending: false, ledgerRevision: 0,
 			metrics: info.backend === "pi" && info.metrics ? { ...info.metrics, ...(info.metrics.contextUsage ? { contextUsage: { ...info.metrics.contextUsage } } : {}) } : undefined,
 		});
 		const getAgent = () => readOnly ? staticSnapshot() : this.snapshot(info.parentSessionId).agents.find((agent) => agent.id === info.id);
@@ -934,6 +978,11 @@ class UnifiedManager {
 		const piSelection = params.backend === "pi" ? resolvePiSpawnSelection({ piModel: params.pi_model, piThinking: params.pi_thinking, template, parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined, parentThinking: this.pi.getThinkingLevel() as ThinkingLevel }) : undefined;
 		if (piSelection) validatePiModelSelection(piSelection, (provider, modelId) => ctx.modelRegistry.find(provider, modelId));
 		const cursorModel = resolveCursorSpawnModel(params.backend, params.cursor_model, template);
+		const codex = isCodexProvider(params.backend, piSelection?.provider);
+		if (codex && template?.tools !== undefined) throw new Error(`Template ${template.name} sets tools, which is incompatible with openai-codex Pi children. The installed Codex conversion owns all tools.`);
+		// Deliberately resolve before any manifest mutation, worktree planning, or viewer creation.
+		const codexConversionRoot = codex ? this.resolveCodexExtension() : undefined;
+		if (codex && !codexConversionRoot) throw new Error(`openai-codex Pi children require a valid global npm installation of ${CODEX_CONVERSION_PACKAGE}. Install it with: pi install npm:${CODEX_CONVERSION_PACKAGE}`);
 		const parent = this.parentSessionId(ctx); const manifest = this.manifest(parent);
 		if (Object.values(manifest.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
 		if (Object.values(manifest.agents).some((agent) => agent.taskName === taskName)) throw new Error(`Agent /${taskName} already exists in this parent session. Use another task_name.`);
@@ -941,13 +990,17 @@ class UnifiedManager {
 		const configuredSkills = params.backend === "pi" ? template?.skills ?? stringList(config.defaults?.skills) : undefined;
 		const configuredExtensions = params.backend === "pi" ? template?.extensions ?? stringList(config.defaults?.extensions) : undefined;
 		const selectedSkills = params.backend === "pi" ? [...new Set([...(configuredSkills ?? []), ...(params.skills ?? [])])] : [];
-		const selectedTools = params.backend === "pi" ? template?.tools ?? (configuredExtensions?.length ? undefined : selectInheritedPiTools(this.pi.getActiveTools(), this.pi.getAllTools())) : undefined;
+		const selectedTools = params.backend === "pi" ? codex ? undefined : template?.tools ?? (configuredExtensions?.length ? undefined : selectInheritedPiTools(this.pi.getActiveTools(), this.pi.getAllTools())) : undefined;
 		const projectResourcesAllowed = catalog.projectStatus === "trusted" || catalog.projectStatus === "not-present";
 		const configuredPolicy: ResourceResolutionPolicy = { projectRoot: catalog.projectRoot, includeProject: template?.scope === "project" };
 		const explicitPolicy: ResourceResolutionPolicy = { projectRoot: catalog.projectRoot, includeProject: projectResourcesAllowed };
 		const configuredSkillSet = new Set(configuredSkills ?? []);
 		const skillPaths = selectedSkills.map((skill) => resolveSkillPath(skill, sourceCwd, configuredSkillSet.has(skill) ? configuredPolicy : explicitPolicy));
-		const extensionPaths = (configuredExtensions ?? []).map((extension) => resolveExtensionPath(extension, sourceCwd, configuredPolicy));
+		const selectedExtensionNames = configuredExtensions ?? [];
+		const selectedExtensionPaths = selectedExtensionNames.map((extension) => resolveExtensionPath(extension, sourceCwd, configuredPolicy));
+		const codexExtensions = codexConversionRoot ? codexExtensionPairs(selectedExtensionNames, selectedExtensionPaths, codexConversionRoot) : undefined;
+		const extensionPaths = codexExtensions?.paths ?? selectedExtensionPaths;
+		const extensionNames = codexExtensions?.names ?? selectedExtensionNames;
 		const defaultIsolation = config.defaults?.isolation === "worktree" || config.defaults?.isolation === "shared" ? config.defaults.isolation : undefined;
 		const isolation = params.isolation ?? template?.isolation ?? defaultIsolation ?? "shared";
 		await this.ensurePrerequisites(params.backend, sourceCwd);
@@ -956,7 +1009,7 @@ class UnifiedManager {
 			worktreePlan = await planManagedWorktree({ sourceCwd, packageRoot: this.paths.root, scopeKey: parentScopeKey(parent), agentId: id, agentSlug: taskName, turnId, collisionId }, { commandRunner: this.commandRunner });
 			worktree = durableWorktree(worktreePlan, now); cwd = worktree.cwd;
 		}
-		const proto: Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed"> = { id, taskName, canonicalName: `/${taskName}`, backend: params.backend, parentSessionId: parent, parentSessionFile: ctx.sessionManager.getSessionFile?.(), agentType: params.agent_type, isolation, worktree, cwd, model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL, provider: piSelection?.provider, modelId: piSelection?.modelId, thinking: piSelection?.thinking, tools: selectedTools, skills: selectedSkills, skillPaths, extensions: configuredExtensions ?? [], extensionPaths, cursorModel, permissionMode: normalizePermissionMode(params.permission_mode ?? template?.permissionMode), sessionFile: undefined, infoFile: "", logFile: "", responseFile: "", createdAt: now, updatedAt: now };
+		const proto: Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed" | "toolCallCount"> = { id, taskName, canonicalName: `/${taskName}`, backend: params.backend, parentSessionId: parent, parentSessionFile: ctx.sessionManager.getSessionFile?.(), agentType: params.agent_type, isolation, worktree, cwd, model: piSelection ? `${piSelection.provider}:${piSelection.modelId}` : cursorModel ?? DEFAULT_CURSOR_MODEL, provider: piSelection?.provider, modelId: piSelection?.modelId, thinking: piSelection?.thinking, tools: selectedTools, skills: selectedSkills, skillPaths, extensions: extensionNames, extensionPaths, cursorModel, permissionMode: normalizePermissionMode(params.permission_mode ?? template?.permissionMode), sessionFile: undefined, infoFile: "", logFile: "", responseFile: "", createdAt: now, updatedAt: now };
 		const prompt = [template?.prompt, params.message].filter(Boolean).join("\n\n");
 		const queued = this.mutate(parent, (current) => {
 			if (Object.values(current.agents).filter((agent) => !agent.closed).length >= MAX_AGENTS) throw new Error(`At most ${MAX_AGENTS} open agents are allowed per parent session.`);
@@ -1030,6 +1083,21 @@ class UnifiedManager {
 			}).finally(release);
 		}
 	}
+	private requireCodexAdmission(agent: ManifestAgent): void {
+		if (!isCodexProvider(agent.backend, agent.provider)) return;
+		const resolved = this.resolveCodexExtension();
+		if (!resolved || !isCanonicalCodexConfiguration(agent, resolved)) throw new Error(`Codex conversion package is unavailable or moved; reinstall ${CODEX_CONVERSION_PACKAGE} before retrying.`);
+	}
+	private failAdmittedCodex(parent: string, turnId: string, agentId: string, message: string): void {
+		const safe = sanitizeTerminalText(message, 500);
+		try {
+			const next = this.mutate(parent, (current) => transitionTurn(current, turnId, "terminal", this.now(), { status: "failed", reason: "codex-extension-unavailable", error: safe }));
+			const info = this.project(next).find((entry) => entry.id === agentId);
+			if (!info) return;
+			this.appendLedger(info, { kind: "error", message: safe }); this.appendLedger(info, { kind: "runtime", state: "failed" }); this.appendLedger(info, { kind: "completion", status: "failed", summary: safe });
+			this.pushMail(this.completionEvent(info)); this.scheduleIdleClose(info); this.requestDrain(parent);
+		} catch { /* admission failures must not launch a runtime */ }
+	}
 	private async launchAdmitted(parent: string, turnId: string): Promise<void> {
 		let item: ReturnType<UnifiedManager["current"]>;
 		try {
@@ -1040,6 +1108,8 @@ class UnifiedManager {
 		} catch { return; }
 		const { agent, turn, info } = item;
 		if (!turn) return;
+		try { this.requireCodexAdmission(agent); }
+		catch (error) { this.failAdmittedCodex(parent, turnId, agent.id, error instanceof Error ? error.message : String(error)); return; }
 
 		// A settled process is deliberately retained for follow-up turns. Its callbacks close
 		// over this same handle, whose turn identity is replaced before dispatch.
@@ -1050,7 +1120,7 @@ class UnifiedManager {
 		const live: RuntimeHandle = {
 			info, kind: agent.backend, turnId, epoch: this.epoch, pi: undefined, cursor: undefined,
 			pending: true, closing: false, generation: 1, currentOutput: "", phase: "Starting",
-			activeTools: new Map(), thoughtChunks: 0, thoughtCharacters: 0, promptPermissionPending: false, pendingApprovals: new Map(), compactionCount: info.metrics?.compactionCount ?? 0,
+			activeTools: new Map(), seenToolStartIds: new Set(), thoughtChunks: 0, thoughtCharacters: 0, promptPermissionPending: false, pendingApprovals: new Map(), compactionCount: info.metrics?.compactionCount ?? 0,
 		};
 		this.live.set(agent.id, live);
 
@@ -1093,7 +1163,10 @@ class UnifiedManager {
 					.catch((error) => this.finishCursor(live, error instanceof Error ? error.message : String(error), generation));
 			}
 		} catch (error) {
-			if (this.matching(live, false)) this.terminal(live, "failed", "", error instanceof Error ? error.message : String(error));
+			// PiRpcClient uses this exact sentinel for extension startup failures; preserve only
+			// that fixed text through manifest/projection terminal handling.
+			const message = error instanceof Error && error.message === PI_EXTENSION_STARTUP_FAILURE ? PI_EXTENSION_STARTUP_FAILURE : error instanceof Error ? error.message : String(error);
+			if (this.matching(live, false)) this.terminal(live, "failed", "", message);
 			await Promise.allSettled([live.pi?.close(), live.cursor?.close()].filter(Boolean) as Promise<void>[]); if (this.live.get(agent.id) === live) this.live.delete(agent.id);
 		}
 	}
@@ -1153,9 +1226,21 @@ class UnifiedManager {
 			await this.launchAdmitted(parent, successor);
 			return { delivery: "cancel-and-prompt", turnId: successor };
 		}
+		const codex = isCodexProvider(item.agent.backend, item.agent.provider);
+		// Resolve before the enqueue/viewer path. Old settled Codex records are normalized in
+		// the same transaction as their successor turn, never launched without conversion.
+		const conversionRoot = codex ? this.resolveCodexExtension() : undefined;
+		if (codex && !conversionRoot) throw new Error(`Codex conversion package is unavailable or moved; reinstall ${CODEX_CONVERSION_PACKAGE} before retrying.`);
 		await this.assertWorktreeReusable(info);
 		const id = this.uuid();
-		let next = this.mutate(parent, (current) => enqueueTurn(current, { id, agentId: info.id, source: "follow-up", execution: this.execution(current.agents[info.id]!, message, message), createdAt: this.now(), ownerEpoch: this.epoch }));
+		let next = this.mutate(parent, (current) => {
+			let normalized = current; const agent = normalized.agents[info.id]!;
+			if (codex) {
+				const extensions = codexExtensionPairs(agent.extensions, agent.extensionPaths, conversionRoot!);
+				if (!isCanonicalCodexConfiguration(agent, conversionRoot!)) normalized = normalizeSettledPiAgentExtensions(normalized, info.id, extensions.names, extensions.paths, this.now());
+			}
+			return enqueueTurn(normalized, { id, agentId: info.id, source: "follow-up", execution: this.execution(normalized.agents[info.id]!, message, message), createdAt: this.now(), ownerEpoch: this.epoch });
+		});
 		let updated = this.project(next).find((entry) => entry.id === info.id)!;
 		// Reconciled work never resumes through its old tab. Explicit new work receives a fresh
 		// queued viewer only after the stale resource is closed and its IDs are durably cleared.
@@ -1310,7 +1395,11 @@ class UnifiedManager {
 		// An idle process can exit between turns; never retain a dead handle.
 		this.live.delete(live.info.id);
 	}
-	private handlePiEvent(live: RuntimeHandle, event: any, turnToken?: string): void { if (!turnToken || !this.matching(live, true, turnToken)) return; if (event.type === "text") { this.flushThought(live); live.currentOutput += event.text; this.setPhase(live, "Writing response"); log(live.info, "assistant", event.text); } else if (event.type === "thought") { this.setPhase(live, "Thinking"); this.bufferThought(live, event.text); log(live.info, "thought", event.text); } else if (event.type === "tool_start") { this.flushThought(live); live.activeTools.set(event.id, compactActivityText(event.name, 80) || "tool"); this.appendLedger(live.info, { kind: "tool-start", id: event.id, name: event.name, input: event.input }); } else if (event.type === "tool_update") { if (live.activeTools.has(event.id)) this.appendLedger(live.info, { kind: "tool-update", id: event.id, status: event.status, count: opaqueToolValueCount(event.partialResult) }); } else if (event.type === "tool_end") { live.activeTools.delete(event.id); this.appendLedger(live.info, { kind: "tool-end", id: event.id, status: event.status, result: event.result, isError: event.isError }); } else if (event.type === "tool_observed") { this.appendLedger(live.info, { kind: "phase", name: event.phase }); } else if (event.type === "phase") this.setPhase(live, event.phase); else if (event.type === "metrics_hint") this.requestMetricsRefresh(live); else if (event.type === "compaction") this.noteCompaction(live, event); else if (event.type === "settled") this.terminal(live, event.error ? "failed" : "completed", event.output ?? live.currentOutput, event.error); this.touch(live); }
+	private acceptToolStart(live: RuntimeHandle, id: unknown): boolean {
+		if (typeof id !== "string" || !id || live.seenToolStartIds.has(id) || !this.matching(live, true, live.turnId)) return false;
+		try { const next = this.mutate(live.info.parentSessionId, (manifest) => incrementAgentToolCallCount(manifest, live.info.id, live.turnId, this.now())); const info = this.project(next).find((entry) => entry.id === live.info.id); if (!info) return false; live.info = info; live.seenToolStartIds.add(id); return true; } catch { return false; }
+	}
+	private handlePiEvent(live: RuntimeHandle, event: any, turnToken?: string): void { if (!turnToken || !this.matching(live, true, turnToken)) return; if (event.type === "text") { this.flushThought(live); live.currentOutput += event.text; this.setPhase(live, "Writing response"); log(live.info, "assistant", event.text); } else if (event.type === "thought") { this.setPhase(live, "Thinking"); this.bufferThought(live, event.text); log(live.info, "thought", event.text); } else if (event.type === "tool_start") { if (this.acceptToolStart(live, event.id)) { this.flushThought(live); live.activeTools.set(event.id, compactActivityText(event.name, 80) || "tool"); this.appendLedger(live.info, { kind: "tool-start", id: event.id, name: event.name, input: event.input }); } } else if (event.type === "tool_update") { if (live.activeTools.has(event.id)) this.appendLedger(live.info, { kind: "tool-update", id: event.id, status: event.status, count: opaqueToolValueCount(event.partialResult) }); } else if (event.type === "tool_end") { live.activeTools.delete(event.id); this.appendLedger(live.info, { kind: "tool-end", id: event.id, status: event.status, result: event.result, isError: event.isError }); } else if (event.type === "tool_observed") { this.appendLedger(live.info, { kind: "phase", name: event.phase }); } else if (event.type === "phase") this.setPhase(live, event.phase); else if (event.type === "metrics_hint") this.requestMetricsRefresh(live); else if (event.type === "compaction") this.noteCompaction(live, event); else if (event.type === "settled") this.terminal(live, event.error ? "failed" : "completed", event.output ?? live.currentOutput, event.error); this.touch(live); }
 	private handleCursorNotification(live: RuntimeHandle, message: JsonRpcMessage, turnToken?: string): void {
 		if (!turnToken || !this.matching(live, true, turnToken)) return;
 		if (message.method === "session/update") {
@@ -1319,7 +1408,7 @@ class UnifiedManager {
 			else if (kind === "agent_thought_chunk") { const text = contentText(update.content); this.setPhase(live, "Thinking"); this.bufferThought(live, text); }
 			else if (kind === "tool_call" || kind === "tool_call_update") {
 				const tool = normalizeCursorToolUpdate(update);
-				if (tool?.type === "tool_start") { live.activeTools.set(tool.id, compactActivityText(tool.name, 80) || "tool"); this.appendLedger(live.info, { kind: "tool-start", id: tool.id, name: tool.name, input: tool.input }); }
+				if (tool?.type === "tool_start") { if (this.acceptToolStart(live, tool.id)) { live.activeTools.set(tool.id, compactActivityText(tool.name, 80) || "tool"); this.appendLedger(live.info, { kind: "tool-start", id: tool.id, name: tool.name, input: tool.input }); } }
 				else if (tool?.type === "tool_update") { if (live.activeTools.has(tool.id)) this.appendLedger(live.info, { kind: "tool-update", id: tool.id, status: tool.status, count: opaqueToolValueCount(tool.partialResult) }); else this.appendLedger(live.info, { kind: "phase", name: "Observed Cursor tool update", detail: tool.id }); }
 				else if (tool?.type === "tool_end") { live.activeTools.delete(tool.id); this.appendLedger(live.info, { kind: "tool-end", id: tool.id, status: tool.status, result: tool.result, isError: tool.isError }); }
 				else if (tool?.type === "tool_observed") this.appendLedger(live.info, { kind: "phase", name: tool.phase });
@@ -1361,7 +1450,7 @@ class UnifiedManager {
 	private clearCompletionMail(parent: string, name: string): void { this.mailbox.remove((event) => event.kind === "completion" && event.parentSessionId === parent && event.agentName === name); }
 	private notifyParent(event: MailEvent): void {
 		if (event.kind === "permission") {
-			this.pi.sendMessage({ customType: "bstn_subagent_permission", content: `Cursor ACP subagent ${event.agentName} requires permission: ${event.summary}.`, display: true, details: { ...event } }, { triggerTurn: true, deliverAs: "followUp" });
+			this.pi.sendMessage({ customType: "bstn_subagent_permission", content: `Cursor ACP subagent ${event.agentName} requires permission: ${event.summary}.`, display: true, details: { kind: "permission", agentName: event.agentName, status: event.status, approvalId: event.approvalId, summary: event.summary, allowOnceOffered: event.allowOnceOffered, turnId: event.turnId } }, { triggerTurn: true, deliverAs: "followUp" });
 			return;
 		}
 		const info = this.get(event.agentName, event.parentSessionId);
@@ -1380,7 +1469,7 @@ class UnifiedManager {
 			createdAt: info.createdAt,
 			completedAt: info.completedAt,
 			metrics: info.backend === "pi" ? info.metrics : undefined,
-			output: output.text,
+			output: output.displayText,
 			truncated: output.truncated,
 			fullOutputPath: output.fullOutputPath,
 		});
@@ -1480,7 +1569,10 @@ class UnifiedManager {
 			const info = infos.find((entry) => !waiter.targets || waiter.targets.has(entry.canonicalName));
 			if (info) waiter.resolve(this.completionEvent(info));
 		}
-		this.mailbox.remove(() => true); this.defaultWaitTargets.clear(); this.stateListeners.clear(); this.lastSnapshots.clear(); this.ctx = undefined;
+		this.mailbox.remove(() => true); this.defaultWaitTargets.clear(); this.stateListeners.clear(); this.lastSnapshots.clear();
+		// Shutdown lifecycle writes may refresh the widget after the eager clear above.
+		// Clear once more before dropping the UI context so reload never leaves stale chrome.
+		this.ctx?.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined); this.ctx = undefined;
 		this.reportParent(false, true);
 	}
 
@@ -1492,7 +1584,7 @@ class UnifiedManager {
 	private setPhase(live: RuntimeHandle, phase: string): void { if (live.phase === phase) return; live.phase = phase; this.appendLedger(live.info, { kind: "phase", name: phase }); this.publishState(live.info.parentSessionId); this.updateWidget(); }
 	private refresh(): void { this.updateWidget(); const ctx = this.ctx; if (!ctx) return; try { const parent = this.parentSessionId(ctx); const working = Object.values(this.manifest(parent).turns).some((turn) => turn.state === "queued" || turn.state === "admitted" || turn.state === "running"); this.reportParent(working); } catch {} }
 	reassertParent(): void { this.refresh(); }
-	private updateWidget(): void { const ctx = this.ctx; if (!ctx || ctx.mode !== "tui") return; let infos: AgentInfo[]; try { infos = this.readScope(this.parentSessionId(ctx)).filter((info) => info.status !== "closed"); } catch { return; } if (!infos.length) { ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined); return; } const activities = new Map(infos.map((info) => [info.id, this.activitySummary(info)])); ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, (_tui, theme) => ({ render: (width: number) => { const running = infos.filter((info) => ["queued", "starting", "running"].includes(info.status)).length; const lines = [theme.fg("accent", theme.bold(`Subagents — ${running} active · ${infos.length - running} settled`))]; for (const info of infos) { const color = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning"; lines.push(`${theme.fg(color, "●")} ${theme.fg("toolTitle", info.canonicalName)} ${theme.fg("dim", formatPersistentWidgetMetadata(info))}`); lines.push(theme.fg("dim", `  ↳ ${activities.get(info.id) ?? "No task summary"}`)); } return lines.map((line) => truncateToWidth(line, width)); }, invalidate() {} })); }
+	private updateWidget(): void { const ctx = this.ctx; if (!ctx || ctx.mode !== "tui") return; let infos: AgentInfo[]; try { infos = this.readScope(this.parentSessionId(ctx)).filter((info) => info.status !== "closed"); } catch { return; } if (!infos.length) { ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, undefined); return; } const activities = new Map(infos.map((info) => [info.id, this.activitySummary(info)])); ctx.ui.setWidget(`${PACKAGE_NAME}:agents`, (_tui, theme) => ({ render: (width: number) => { const lines = [theme.fg("accent", theme.bold("Agents"))]; for (const info of infos) { const color = info.status === "failed" ? "error" : info.status === "completed" ? "success" : "warning"; lines.push(`${theme.fg(color, "●")} ${theme.fg("toolTitle", info.canonicalName)} ${theme.fg("dim", formatPersistentWidgetMetadata(info))}`); lines.push(theme.fg("dim", `  ↳ ${activities.get(info.id) ?? "No task summary"}`)); } return lines.map((line) => truncateToWidth(line, width)); }, invalidate() {} }), { placement: "belowEditor" }); }
 	private reportParent(working: boolean, force = false): void { if (this.herdr?.reportParent) { if (!force && working === this.parentWorking) return; this.parentWorking = working; this.parentQueue = this.parentQueue.then(() => this.herdr!.reportParent!(working)).catch(() => undefined); return; } const paneId = process.env.HERDR_PANE_ID; if (!paneId || process.env.HERDR_ENV !== "1" || (!force && working === this.parentWorking)) return; this.parentWorking = working; const seq = ++this.parentSeq; const args = working ? ["pane", "report-agent", paneId, "--source", PARENT_SOURCE, "--agent", "pi", "--state", "working", "--message", "Subagent working", "--seq", String(seq)] : ["pane", "release-agent", paneId, "--source", PARENT_SOURCE, "--agent", "pi", "--seq", String(seq)]; this.parentQueue = this.parentQueue.then(async () => { await this.commandRunner(resolveExecutable("herdr", process.env.HERDR_BIN), args, this.ctx?.cwd ?? process.cwd(), 5000); }).catch(() => undefined); }
 }
 
@@ -1509,14 +1601,14 @@ function eventText(event: MailEvent, manager: UnifiedManager, parentSessionId: s
 	if (event.kind === "permission") {
 		return {
 			text: `Permission required by ${event.agentName}: ${event.summary}\nApproval id: ${event.approvalId}\n${event.allowOnceOffered ? "Call respond_agent_permission with decision=approve or reject, then wait again." : "Allow-once is unavailable; reject this request with respond_agent_permission, then wait again."}`,
-			details: { ...event },
+			details: { kind: "permission", agentName: event.agentName, status: event.status, approvalId: event.approvalId, summary: event.summary, allowOnceOffered: event.allowOnceOffered, turnId: event.turnId },
 		};
 	}
 	const info = manager.get(event.agentName, parentSessionId);
 	const output = boundedResult(event.finalResponse ?? event.error ?? "", info);
 	return {
 		text: JSON.stringify({ agent_name: event.agentName, status: event.status, terminal_reason: event.terminalReason, turn_id: event.turnId, finalResponse: output.text, error: event.error }, null, 2),
-		details: { ...event, turn_id: event.turnId, terminal_reason: event.terminalReason, truncated: output.truncated, fullOutputPath: output.fullOutputPath },
+		details: { kind: "completion", ...buildCompletionFollowUpDetails({ agentName: event.agentName, mailStatus: event.status, agentStatus: info.status, terminalReason: event.terminalReason, turnId: event.turnId, backend: info.backend, model: info.model, thinking: info.backend === "pi" ? info.thinking : undefined, isolation: info.isolation, startedAt: info.startedAt, createdAt: info.createdAt, completedAt: info.completedAt, metrics: info.backend === "pi" ? info.metrics : undefined, output: output.displayText, truncated: output.truncated }), turn_id: event.turnId, terminal_reason: event.terminalReason },
 	};
 }
 
@@ -1593,8 +1685,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			const catalog = publicAgentTemplateCatalog(manager.templateCatalog(ctx));
 			return textResult(JSON.stringify(catalog, null, 2), catalog);
 		},
-		renderCall(_args, theme) { return new Text(theme.fg("toolTitle", theme.bold("list_agent_templates")), 0, 0); },
-		renderResult(result: any, _options, theme) { return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ template listing failed" : `✓ ${result.details?.templates?.length ?? 0} templates`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderTemplatesCall(args, theme), 0, 0); },
+		renderResult(result: any, options, theme) { return new Text(renderTemplatesResult(result, options, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1615,13 +1707,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			const catalog = await listSubagentModels(ctx, params);
 			return subagentModelToolResult(catalog);
 		},
-		renderCall(args, theme) {
-			const scope = [args.backend, args.search].filter(Boolean).join(" · ") || "all";
-			return new Text(theme.fg("toolTitle", theme.bold("list_subagent_models ")) + theme.fg("accent", scope), 0, 0);
-		},
-		renderResult(result: any, _options, theme) {
-			return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ model listing failed" : `✓ ${result.details?.models?.length ?? 0}/${result.details?.total ?? 0} models`), 0, 0);
-		},
+		renderCall(args, theme) { return new Text(renderModelsCall(args, theme), 0, 0); },
+		renderResult(result: any, options, theme) { return new Text(renderModelsResult(result, options, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1636,8 +1723,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			const rendered = eventText(event, manager, parent);
 			return textResult(rendered.text, rendered.details);
 		},
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("wait_agent ")) + theme.fg("accent", args.targets?.join(",") || "any"), 0, 0); },
-		renderResult(result: any, options: any, theme) { const progress = result.details?.wait_progress; return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ wait failed" : options?.isPartial && progress ? formatWaitProgressRows(progress) : result.details?.kind === "permission" ? "⚿ permission required" : `✓ ${result.details?.agentName ?? "done"}`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderWaitCall(args, theme), 0, 0); },
+		renderResult(result: any, options: any, theme) { return new Text(renderWaitResult(result, options, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1657,10 +1744,10 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 				const output = boundedResult(info.finalResponse ?? info.error ?? "", info);
 				return { agent_name: info.canonicalName, backend: info.backend, status: info.status === "paused" ? "interrupted" : info.status, terminal_reason: info.terminalReason, finalResponse: output.text, error: info.error };
 			});
-			return textResult(JSON.stringify({ responses }, null, 2), { responses });
+			return textResult(JSON.stringify({ responses }, null, 2), { responses: responses.map(({ agent_name, backend, status, terminal_reason }) => ({ agent_name, backend, status, terminal_reason })) });
 		},
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("wait_all_agents ")) + theme.fg("accent", args.targets?.join(",") || "all"), 0, 0); },
-		renderResult(result: any, options: any, theme) { const progress = result.details?.wait_progress; return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ wait failed" : options?.isPartial && progress ? formatWaitProgressRows(progress) : `✓ ${result.details?.responses?.length ?? 0} agents`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderWaitAllCall(args, theme), 0, 0); },
+		renderResult(result: any, options: any, theme) { return new Text(renderWaitAllResult(result, options, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1692,8 +1779,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			}));
 			return textResult(JSON.stringify({ agents }, null, 2), { agents });
 		},
-		renderCall(_args, theme) { return new Text(theme.fg("toolTitle", theme.bold("list_agents")), 0, 0); },
-		renderResult(result: any, _options, theme) { return new Text(theme.fg("success", `✓ ${result.details?.agents?.length ?? 0} agents`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderAgentsCall(args, theme), 0, 0); },
+		renderResult(result: any, options, theme) { return new Text(renderAgentsResult(result, options, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1704,10 +1791,10 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		async execute(_id, params, _signal, _update, ctx) {
 			const result = manager.readResponse(manager.parentSessionId(ctx), params.target);
 			const bounded = boundedResult(result.response, result.info);
-			return textResult(JSON.stringify({ agent_name: result.info.canonicalName, status: result.info.status, finalResponse: bounded.text }, null, 2), { agent_name: result.info.canonicalName, status: result.info.status, truncated: bounded.truncated, fullOutputPath: bounded.fullOutputPath });
+			return textResult(JSON.stringify({ agent_name: result.info.canonicalName, status: result.info.status, finalResponse: bounded.text }, null, 2), { agent_name: result.info.canonicalName, status: result.info.status, output: bounded.displayText, truncated: bounded.truncated });
 		},
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("read_agent_response ")) + theme.fg("accent", args.target), 0, 0); },
-		renderResult(result: any, _options, theme) { return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ read failed" : `✓ ${result.details?.agent_name}`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderTargetCall("Read", args, theme), 0, 0); },
+		renderResult(result: any, options, theme) { return new Text(renderReadResult(result, options, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1719,8 +1806,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			const result = await manager.send(manager.parentSessionId(ctx), params.target, params.message);
 			return textResult(result.delivery === "steer" ? "Message steered into running Pi agent." : result.delivery === "cancel-and-prompt" ? "Running Cursor turn cancelled; corrective turn admitted on the same ACP session." : "Message queued as a new agent turn.", { target: params.target, ...result, turn_id: result.turnId });
 		},
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("send_message ")) + theme.fg("accent", args.target), 0, 0); },
-		renderResult(result: any, _options, theme) { return new Text(theme.fg(result.isError ? "error" : "success", result.isError ? "✗ send failed" : `✓ ${result.details?.delivery}`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderTargetCall("Send", args, theme), 0, 0); },
+		renderResult(result: any, _options, theme) { return new Text(renderSendResult(result, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1733,8 +1820,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			const info = manager.get(params.target, parent);
 			return textResult("Interrupt handled.", { target: params.target, previous_status: previous, status: info.status, turn_id: info.currentTurnId });
 		},
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("interrupt_agent ")) + theme.fg("accent", args.target), 0, 0); },
-		renderResult(result: any, _options, theme) { return new Text(theme.fg("warning", `↯ previous: ${result.details?.previous_status}`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderTargetCall("Interrupt", args, theme), 0, 0); },
+		renderResult(result: any, _options, theme) { return new Text(renderInterruptResult(result, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1747,8 +1834,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			const info = manager.get(params.target, parent);
 			return textResult("Agent closed.", { target: params.target, previous_status: previous, status: info.status, turn_id: info.currentTurnId, isolation: info.isolation, ...(info.worktree ? { worktree: { branch: info.worktree.branch, worktree_root: info.worktree.worktreeRoot, phase: info.worktree.phase, reason: info.worktree.reason ?? null, final_commit: info.worktree.finalCommit ?? null, final_branch: info.worktree.finalBranch ?? null, changed_files: info.worktree.changedFiles ?? null, untracked_files: info.worktree.untrackedFiles ?? null } } : {}) });
 		},
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("close_agent ")) + theme.fg("accent", args.target), 0, 0); },
-		renderResult(result: any, _options, theme) { return new Text(theme.fg("success", `✓ previous: ${result.details?.previous_status}`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderTargetCall("Close", args, theme), 0, 0); },
+		renderResult(result: any, _options, theme) { return new Text(renderCloseResult(result, theme), 0, 0); },
 	});
 
 	pi.registerTool({
@@ -1765,8 +1852,8 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 			manager.respondPermission(manager.parentSessionId(ctx), params.target, params.approval_id, params.decision);
 			return textResult(params.decision === "approve" ? "Permission approved once." : "Permission rejected.", { target: params.target, approval_id: params.approval_id, decision: params.decision });
 		},
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("respond_agent_permission ")) + theme.fg("accent", `${args.target} ${args.decision}`), 0, 0); },
-		renderResult(result: any, _options, theme) { return new Text(theme.fg(result.details?.decision === "approve" ? "success" : "warning", `✓ ${result.details?.decision}`), 0, 0); },
+		renderCall(args, theme) { return new Text(renderPermissionCall(args, theme), 0, 0); },
+		renderResult(result: any, _options, theme) { return new Text(renderPermissionResult(result, theme), 0, 0); },
 	});
 
 	async function openOverlay(ctx: ExtensionCommandContext, initialTarget: string, scopeParent = manager.parentSessionId(ctx), includeAll = false): Promise<void> {
@@ -1851,7 +1938,7 @@ export function registerUnifiedSubagents(pi: ExtensionAPI, dependencies: Unified
 		new Text(renderCompletionMessage(message as { details?: CompletionRenderDetails | null; content?: unknown }, options, theme), 0, 0)
 	);
 	pi.registerMessageRenderer("bstn_subagent_permission", (message, _options, theme) =>
-		new Text(theme.fg("warning", String(message.content ?? "Cursor permission required")), 0, 0)
+		new Text(renderPermissionCard(message, theme), 0, 0)
 	);
 
 	pi.registerCommand("agents", {

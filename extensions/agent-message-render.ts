@@ -67,6 +67,24 @@ export interface CompletionRenderDetails {
 const PREVIEW_CODE_POINTS = 100;
 const EXPANDED_OUTPUT_LINES = 30;
 
+/** Safe terminal display primitive shared by message and tool cards. */
+export function safeDisplayText(value: unknown, max: number, fallback = "—"): string {
+	if (typeof value !== "string") return fallback;
+	const clean = value
+		.replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, "")
+		.replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+		.replace(/\s+/g, " ").trim();
+	if (!clean) return fallback;
+	const points = Array.from(clean); const cap = Math.max(0, Math.floor(max));
+	return points.length <= cap ? clean : cap < 2 ? "…" : `${points.slice(0, cap - 1).join("")}…`;
+}
+const COMPLETION_STATUS = new Set(["queued", "starting", "running", "completed", "failed", "interrupted", "paused", "closed"]);
+const COMPLETION_BACKEND = new Set(["pi", "cursor"]);
+const COMPLETION_ISOLATION = new Set(["shared", "worktree"]);
+const COMPLETION_THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+function completionEnum(value: unknown, values: Set<string>): string { return typeof value === "string" && values.has(value) ? value : "—"; }
+
 /** Compact token counts for muted usage stats (matches Pi footer's shape). */
 export function formatCompactTokens(count: number): string {
 	if (!Number.isFinite(count) || count < 0) return "—";
@@ -107,9 +125,7 @@ export function spawnTaskLabel(taskName: unknown): string {
 }
 
 function asNonemptyString(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const trimmed = value.trim();
-	return trimmed ? trimmed : undefined;
+	const text = safeDisplayText(value, 120, ""); return text || undefined;
 }
 
 function joinStats(parts: Array<string | undefined>): string {
@@ -117,20 +133,11 @@ function joinStats(parts: Array<string | undefined>): string {
 }
 
 function compactControlStrip(value: string, maxCodePoints = PREVIEW_CODE_POINTS): string {
-	const clean = sanitizeOutputLine(value)
-		.replace(/\s+/g, " ")
-		.trim();
-	const points = Array.from(clean);
-	if (points.length <= maxCodePoints) return clean;
-	return `${points.slice(0, Math.max(0, maxCodePoints - 1)).join("")}…`;
+	return safeDisplayText(value, maxCodePoints, "");
 }
 
-/** Remove terminal-control and bidi-control sequences while preserving ordinary line spacing. */
-function sanitizeOutputLine(value: string): string {
-	return value
-		.replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
-		.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ");
-}
+/** Safe one-line rendering while preserving callers' line boundaries. */
+function sanitizeOutputLine(value: unknown): string { return safeDisplayText(value, 400, ""); }
 
 function firstNonemptyPreview(output: string): string {
 	for (const line of output.split("\n")) {
@@ -235,7 +242,7 @@ export const COMPLETION_FOLLOW_UP_DETAIL_KEYS = [
 
 export function renderSpawnCall(args: SpawnCallArgs | null | undefined, theme: MessageTheme): string {
 	const safe = args ?? {};
-	const label = spawnTaskLabel(safe.task_name);
+	const label = safeDisplayText(spawnTaskLabel(safe.task_name), 64, "/?");
 	const backend = asNonemptyString(safe.backend) ?? "?";
 	const agentType = asNonemptyString(safe.agent_type);
 	let text = `${theme.fg("toolTitle", "▸")} ${theme.fg("accent", label)} ${theme.fg("dim", `[${backend}]`)}`;
@@ -269,8 +276,12 @@ function completionStatusStyle(status: string): { icon: string; color: ThemeColo
 		case "paused":
 		case "closed":
 			return { icon: "■", color: "muted" };
-		default:
+		case "queued":
+		case "starting":
+		case "running":
 			return { icon: "●", color: "dim" };
+		default:
+			return { icon: "■", color: "muted" };
 	}
 }
 
@@ -282,14 +293,14 @@ function usageLabel(backend: string, metrics: unknown): string {
 }
 
 function completionStatsLine(details: CompletionRenderDetails): string {
-	const backend = asNonemptyString(details.backend) ?? "?";
-	const model = asNonemptyString(details.model);
-	const thinking = backend === "pi" ? asNonemptyString(details.thinking) : undefined;
-	const isolation = asNonemptyString(details.isolation);
-	const isolationSignal = isolation && isolation !== "shared" ? isolation : undefined;
-	const duration = typeof details.durationMs === "number" && Number.isFinite(details.durationMs)
+	const backend = completionEnum(details.backend, COMPLETION_BACKEND);
+	const model = safeDisplayText(details.model, 96);
+	const thinking = backend === "pi" ? completionEnum(details.thinking, COMPLETION_THINKING) : undefined;
+	const isolation = completionEnum(details.isolation, COMPLETION_ISOLATION);
+	const isolationSignal = isolation !== "shared" ? isolation : undefined;
+	const duration = typeof details.durationMs === "number" && Number.isFinite(details.durationMs) && details.durationMs >= 0
 		? formatDurationMs(details.durationMs)
-		: undefined;
+		: "—";
 	return joinStats([
 		backend,
 		model,
@@ -310,12 +321,12 @@ export function renderCompletionMessage(
 	theme: MessageTheme,
 ): string {
 	const details = message.details ?? {};
-	const displayStatus = asNonemptyString(details.agentStatus) ?? asNonemptyString(details.status) ?? "completed";
+	const displayStatus = completionEnum(details.agentStatus, COMPLETION_STATUS) !== "—" ? completionEnum(details.agentStatus, COMPLETION_STATUS) : completionEnum(details.status, COMPLETION_STATUS);
 	const { icon, color } = completionStatusStyle(displayStatus);
-	const name = asNonemptyString(details.agentName) ?? "Subagent";
+	const name = safeDisplayText(details.agentName, 64, "Subagent");
 	const lines = [
 		`${theme.fg(color, icon)} ${theme.fg("toolTitle", theme.bold(name))} ${theme.fg("dim", displayStatus)}`,
-		theme.fg("dim", completionStatsLine(details)),
+		theme.fg("dim", `  ⎿  ${completionStatsLine(details)}`),
 	];
 
 	const output = boundedOutputText(details);
@@ -324,18 +335,15 @@ export function renderCompletionMessage(
 		const visible = all.slice(0, EXPANDED_OUTPUT_LINES);
 		if (!visible.length) lines.push(theme.fg("dim", "  ⎿  No output"));
 		else {
-			for (const line of visible) lines.push(theme.fg("customMessageText", `  ${sanitizeOutputLine(line)}`));
+			for (const line of visible) lines.push(theme.fg("customMessageText", `  ⎿  ${sanitizeOutputLine(line) || "—"}`));
 			const omitted = all.length - visible.length;
-			if (omitted > 0) lines.push(theme.fg("muted", `  … ${omitted} more lines`));
+			if (omitted > 0) lines.push(theme.fg("muted", `  ⎿  … ${omitted} more lines`));
 		}
 	} else {
 		const preview = firstNonemptyPreview(output);
 		lines.push(theme.fg("dim", `  ⎿  ${preview || "No output"}`));
 	}
 
-	if (options.expanded && details.truncated === true && asNonemptyString(details.fullOutputPath)) {
-		lines.push(theme.fg("muted", asNonemptyString(details.fullOutputPath)!));
-	}
 
 	return lines.join("\n");
 }

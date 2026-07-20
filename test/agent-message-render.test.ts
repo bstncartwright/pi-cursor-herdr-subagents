@@ -199,15 +199,24 @@ test("completion renderer status styles, stats, collapsed/expanded, and never us
 		content: "content-fallback",
 	}, { expanded: true }, identity);
 	assert.match(expanded, /^■ \/alpha closed\n/);
-	assert.match(expanded, /^  line-0$/m);
-	assert.match(expanded, /^  line-29$/m);
+	assert.match(expanded, /^  ⎿  line-0$/m);
+	assert.match(expanded, /^  ⎿  line-29$/m);
 	assert.doesNotMatch(expanded, /line-30/);
 	assert.match(expanded, /… 5 more lines/);
-	assert.match(expanded, /\/tmp\/full\.txt/);
-	assert.doesNotMatch(expanded, /content-fallback|  ⎿|\u001b|\u202e/);
+	assert.doesNotMatch(expanded, /\/tmp\/full\.txt/);
+	assert.doesNotMatch(expanded, /content-fallback|\u001b|\u202e/);
 
 	const collapsedTruncated = renderCompletionMessage({
 		details: { ...piDetails, truncated: true, fullOutputPath: "/private/response.txt" },
 	}, { expanded: false }, identity);
 	assert.doesNotMatch(collapsedTruncated, /\/private\/response\.txt/);
+});
+
+
+test("completion renderer sanitizes all malformed detail fields and never displays paths", () => {
+	const hostile = "\u001b]0;title\u0007bad\n\u202ereversed";
+	const rendered = renderCompletionMessage({ details: { agentName: hostile, backend: hostile, status: hostile, agentStatus: hostile, model: hostile, thinking: hostile, isolation: hostile, durationMs: "bad", output: `${hostile}\nline`, truncated: true, fullOutputPath: "/private/full" } }, { expanded: true }, identity);
+	assert.match(rendered, /^■ bad reversed —/m);
+	assert.doesNotMatch(rendered, /\x1b|\u202e|title|\/private/);
+	assert.match(rendered, /  ⎿  bad\n  ⎿  reversed/);
 });

@@ -77,7 +77,7 @@ export interface AgentStateSnapshot {
 	status: "queued" | "starting" | "running" | "completed" | "failed" | "interrupted" | "paused" | "closed";
 	createdAt: number; updatedAt: number; startedAt?: number; completedAt?: number; closedAt?: number; lastActivityAt: number;
 	/** Sanitized runtime phase/tool metadata only. */ activity: string | null;
-	turnId?: string; turnSequence?: number; turnOrdinal?: number; terminalReason?: string; queuePosition?: number; permissionPending: boolean;
+	turnId?: string; turnSequence?: number; turnOrdinal?: number; terminalReason?: string; toolCallCount?: number; queuePosition?: number; permissionPending: boolean;
 	/** In-memory semantic journal revision; never canonical lifecycle state. */ ledgerRevision: number;
 	/** Pi only; Cursor intentionally has no estimates. */ metrics?: AgentMetricsSnapshot;
 }
@@ -103,6 +103,8 @@ export interface UnifiedSubagentDependencies {
 	commandRunner?: CommandRunner;
 	herdr?: HerdrOperations;
 	createPiRuntime?: (info: PiRuntimeAgent, handlers: { onEvent(event: unknown, turnToken?: string): void; onExit(error?: Error): void }) => PiRuntime;
+	/** Test seam for the globally installed Codex conversion resolver. */
+	resolveCodexExtension?: () => string | undefined;
 	createCursorRuntime?: (cwd: string, handlers: {
 		onNotification(message: JsonRpcMessage, turnToken?: string): void;
 		onRequest(message: JsonRpcMessage, turnToken?: string): Promise<unknown>;

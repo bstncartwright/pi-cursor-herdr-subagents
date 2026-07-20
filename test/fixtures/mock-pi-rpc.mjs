@@ -9,7 +9,7 @@ const response = (request, data) => send({ id: request.id, type: "response", com
 
 function handle(request) {
 	if (record) appendFileSync(record, `${JSON.stringify({ request })}\n`);
-	if (request.type === "get_state") return response(request, { model: null, isStreaming: false });
+	if (request.type === "get_state") { if (process.env.MOCK_PI_STARTUP_EXTENSION_ERROR) send({ type: "extension_error", error: process.env.MOCK_PI_STARTUP_EXTENSION_ERROR }); return response(request, { model: null, isStreaming: false }); }
 	if (request.type === "get_session_stats") return response(request, { sessionFile: "/private/session.jsonl", sessionId: "discard-me", userMessages: 1, assistantMessages: 1, toolCalls: 1, toolResults: 1, totalMessages: 4, tokens: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, total: 14 }, cost: 0.25, contextUsage: { tokens: 7, contextWindow: 1000, percent: 0.7 } });
 	if (request.type === "prompt") {
 		response(request);

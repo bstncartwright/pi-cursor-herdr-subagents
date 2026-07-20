@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { PiRpcClient } from "../extensions/pi-runtime.ts";
+import { PI_EXTENSION_STARTUP_FAILURE, PiRpcClient } from "../extensions/pi-runtime.ts";
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "mock-pi-rpc.mjs");
 
@@ -27,4 +27,13 @@ test("PiRpcClient exercises real argv/JSONL lifecycle, stats, token correlation,
 		for (const [key, value] of Object.entries({ PI_SUBAGENT_PI_BIN: previous.bin, MOCK_PI_RECORD: previous.record, MOCK_PI_EXIT: previous.exit, HERDR_ENV: previous.herdr, HERDR_PANE_ID: previous.pane, HERDR_TAB_ID: previous.tab })) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("PiRpcClient turns an extension_error before startup state into a bounded startup failure and closes the child", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-runtime-startup-error-")); const cwd = join(root, "cwd"); await mkdir(cwd); const exited = join(root, "exited"); const record = join(root, "record.jsonl"); const executable = join(root, "mock-pi"); writeFileSync(executable, `#!${process.execPath}\nimport ${JSON.stringify(pathToFileURL(fixture).href)};\n`); chmodSync(executable, 0o700);
+	const previous = { bin: process.env.PI_SUBAGENT_PI_BIN, exit: process.env.MOCK_PI_EXIT, record: process.env.MOCK_PI_RECORD, error: process.env.MOCK_PI_STARTUP_EXTENSION_ERROR }; Object.assign(process.env, { PI_SUBAGENT_PI_BIN: executable, MOCK_PI_EXIT: exited, MOCK_PI_RECORD: record, MOCK_PI_STARTUP_EXTENSION_ERROR: "\u001b[31mbroken conversion\u001b[0m\nsecret" });
+	const logs: string[] = []; const client = new PiRpcClient({ canonicalName: "/fixture", cwd, provider: "fixture", modelId: "model", tools: undefined, extensionPaths: ["/conversion", "/selected", "/guard"], sessionFile: join(root, "session.jsonl"), logFile: join(root, "events.log") }, () => {}, () => {}, (_category, message) => logs.push(message));
+	try {
+		await assert.rejects(() => client.start(), (error: unknown) => error instanceof Error && error.message === PI_EXTENSION_STARTUP_FAILURE); await new Promise((resolve) => setTimeout(resolve, 100)); assert.ok(existsSync(exited)); assert.match(logs.join("\n"), /broken conversion[\s\S]*secret/); assert.doesNotMatch(PI_EXTENSION_STARTUP_FAILURE, /broken conversion|secret/); const argv = JSON.parse(readFileSync(record, "utf8").split("\n")[0]!).argv as string[]; assert.equal(argv.includes("--tools"), false); assert.deepEqual(argv.filter((value) => ["/conversion", "/selected", "/guard"].includes(value)), ["/conversion", "/selected", "/guard"]);
+	} finally { await client.close().catch(() => undefined); for (const [key, value] of Object.entries({ PI_SUBAGENT_PI_BIN: previous.bin, MOCK_PI_EXIT: previous.exit, MOCK_PI_RECORD: previous.record, MOCK_PI_STARTUP_EXTENSION_ERROR: previous.error })) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } await rm(root, { recursive: true, force: true }); }
 });

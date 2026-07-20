@@ -8,6 +8,8 @@ import type { PiRuntimeAgent, PiSessionStats } from "./unified-deps.ts";
 import { childEnvironment } from "./acp.ts";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+/** Never expose child extension diagnostics through a runtime error or persisted projection. */
+export const PI_EXTENSION_STARTUP_FAILURE = "Child Pi extension failed during startup.";
 function statsNumber(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined; }
 function statsInteger(value: unknown): number | undefined { return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : undefined; }
 function statsCount(value: unknown): boolean { return statsInteger(value) !== undefined; }
@@ -142,6 +144,9 @@ export class PiRpcClient {
 	private closed = false;
 	private candidateResponse = "";
 	private candidateError?: string;
+	private startupInProgress = false;
+	private startupFailure?: Error;
+	private startupClose?: Promise<void>;
 
 	constructor(info: PiRuntimeAgent, onEvent: (event: any, turnToken?: string) => void, onExit: (error?: Error) => void, log: (category: string, message: string) => void) {
 		this.info = info;
@@ -151,6 +156,7 @@ export class PiRpcClient {
 	}
 
 	async start(): Promise<void> {
+		this.startupInProgress = true;
 		const launch = piInvocation();
 		const args = [
 			...launch.prefix,
@@ -177,7 +183,10 @@ export class PiRpcClient {
 		this.proc.stderr.on("data", (chunk) => this.log("pi stderr", chunk.toString().trimEnd()));
 		this.proc.on("error", (error) => this.finish(error));
 		this.proc.on("exit", (code, signal) => this.finish(this.closed ? undefined : new Error(`Child Pi exited (${code ?? signal ?? "unknown"}).`)));
-		await this.command({ type: "get_state" });
+		try { await this.command({ type: "get_state" }); }
+		catch (error) { if (this.startupFailure) await this.startupClose?.catch(() => undefined); throw error; }
+		finally { this.startupInProgress = false; }
+		if (this.startupFailure) throw this.startupFailure;
 	}
 
 	async getSessionStats(): Promise<PiSessionStats> {
@@ -236,10 +245,28 @@ export class PiRpcClient {
 		});
 	}
 
+	private extensionDiagnostic(event: Record<string, unknown>): string {
+		return typeof event.error === "string" ? event.error : typeof event.message === "string" ? event.message : "extension error";
+	}
+	private failStartup(error: Error): void {
+		if (this.startupFailure) return;
+		this.startupFailure = error;
+		this.startupInProgress = false;
+		for (const pending of this.requests.values()) { clearTimeout(pending.timer); pending.reject(error); }
+		this.requests.clear();
+		this.startupClose = this.close().catch(() => undefined);
+	}
 	private handleLine(line: string): void {
 		if (!line.trim()) return;
 		let event: any;
 		try { event = JSON.parse(line); } catch { this.log("pi rpc", `invalid JSON: ${line.slice(0, 500)}`); return; }
+		if (event.type === "extension_error") {
+			// Raw child diagnostics belong only in the explicitly raw diagnostics log. They must
+			// never become an Error message that reaches manifests, projections, or tool output.
+			this.log("pi extension", this.extensionDiagnostic(event));
+			if (this.startupInProgress) this.failStartup(new Error(PI_EXTENSION_STARTUP_FAILURE));
+			return;
+		}
 		if (event.type === "response" && event.id) {
 			const pending = this.requests.get(event.id);
 			if (!pending) return;

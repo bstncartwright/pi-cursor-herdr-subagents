@@ -7,7 +7,9 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { registerUnifiedSubagents } from "../extensions/unified.ts";
+import { parentScopeKey, registerUnifiedSubagents } from "../extensions/unified.ts";
+import { PI_EXTENSION_STARTUP_FAILURE } from "../extensions/pi-runtime.ts";
+import { addAgentAtScope, createParentManifest, enqueueTurn, transitionTurn } from "../extensions/turn-manifest.ts";
 import type {
 	HerdrAgent, HerdrOperations, PiRuntime, PiRuntimeAgent,
 	UnifiedSubagentDependencies, UnifiedTestObserver,
@@ -109,7 +111,7 @@ class Gate {
 
 interface ProjectionCapture { pi: Array<Record<string, unknown>>; herdr: Array<Record<string, unknown>>; }
 
-function dependencies(root: string, events: string[], runtimes: FakeRuntimes, observer: (value: UnifiedTestObserver) => void, options: { failPiStart?: boolean; viewerCloseGate?: Gate; failViewerCloseFor?: Set<string>; projections?: ProjectionCapture; mutateProjections?: boolean; productionHerdr?: boolean } = {}): UnifiedSubagentDependencies {
+function dependencies(root: string, events: string[], runtimes: FakeRuntimes, observer: (value: UnifiedTestObserver) => void, options: { failPiStart?: boolean | Error; viewerCloseGate?: Gate; failViewerCloseFor?: Set<string>; projections?: ProjectionCapture; mutateProjections?: boolean; productionHerdr?: boolean; resolveCodexExtension?: () => string | undefined } = {}): UnifiedSubagentDependencies {
 	let tick = 1_000;
 	let id = 0;
 	const herdr: HerdrOperations = {
@@ -134,12 +136,13 @@ function dependencies(root: string, events: string[], runtimes: FakeRuntimes, ob
 		clock: () => ++tick, uuid: () => `fake-${++id}`,
 		paths: { root, configPath: join(root, "config.json"), agentsDir: join(root, "agents"), runsDir: join(root, "runs"), cursorConfigPath: join(root, "cursor.json") },
 		...(options.productionHerdr ? {} : { herdr }), onReady: observer,
+		...(options.resolveCodexExtension ? { resolveCodexExtension: options.resolveCodexExtension } : {}),
 		createPiRuntime: (info, handlers) => {
 			const safe = { ...info, skillPaths: info.skillPaths ? [...info.skillPaths] : undefined, extensionPaths: info.extensionPaths ? [...info.extensionPaths] : undefined };
 			options.projections?.pi.push({ ...info });
 			const runtime = runtimes.createPi(safe, handlers);
 			if (options.mutateProjections) Object.assign(info, { canonicalName: "/corrupted", parentSessionId: "leak", finalResponse: "leak" });
-			if (options.failPiStart) return { ...runtime, async start() { throw new Error("start failure"); } };
+			if (options.failPiStart) return { ...runtime, async start() { throw options.failPiStart instanceof Error ? options.failPiStart : new Error("start failure"); } };
 			return runtime;
 		},
 		createCursorRuntime: cursorFactory(runtimes),
@@ -497,4 +500,152 @@ test("spawn and automatic completion message renderers use the redesign contract
 		await api.emit("session_shutdown");
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("remaining tool cards wire safe projections, foreground waits, and automatic permissions", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-tool-cards-"));
+	const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi();
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, () => {}));
+	const ctx = context("parent-tool-cards", root);
+	const theme = { fg(_color: string, text: string) { return text; }, bold(text: string) { return text; } };
+	const textOf = (component: { render(width: number): string[] }) => component.render(200).join("\n");
+	try {
+		for (const [tool, label] of [["list_agent_templates", "Templates"], ["list_subagent_models", "Models"], ["wait_agent", "Wait"], ["wait_all_agents", "Wait all"], ["list_agents", "Agents"], ["read_agent_response", "Read"], ["send_message", "Send"], ["interrupt_agent", "Interrupt"], ["close_agent", "Close"], ["respond_agent_permission", "Permission"]] as const) {
+			const registered = api.tools.get(tool); assert.ok(registered?.renderCall && registered.renderResult, tool);
+			assert.match(textOf(registered.renderCall!({ target: "/a", targets: ["/a"], decision: "approve" }, theme)), new RegExp(label));
+		}
+		await execute(api, "spawn_agent", { task_name: "wait", message: "secret wait payload", backend: "pi" }, ctx); await turn();
+		const wait = api.tools.get("wait_agent")!; const updates: any[] = [];
+		const pending = wait.execute("wait", { targets: ["wait"] }, undefined, (value: any) => updates.push(value), ctx);
+		assert.ok(updates.length); const partial = textOf(wait.renderResult!({ isError: false, details: updates[0]!.details }, { isPartial: true, expanded: true }, theme));
+		assert.match(partial, /Waiting/); assert.doesNotMatch(partial, /secret wait payload|turn-/);
+		runtimes.settlePi("/wait", "safe completion"); const completion = await pending;
+		assert.equal(completion.content[0].text, JSON.stringify({ agent_name: "/wait", status: "completed", terminal_reason: undefined, turn_id: completion.details.turn_id, finalResponse: "safe completion", error: undefined }, null, 2));
+		for (const forbidden of ["id", "parentSessionId", "createdAt", "finalResponse", "error", "responseFile", "logFile", "cwd"]) assert.equal(Object.hasOwn(completion.details, forbidden), false, forbidden);
+		assert.equal(completion.details.kind, "completion"); assert.equal(completion.details.output, "safe completion");
+		const read = await execute(api, "read_agent_response", { target: "wait" }, ctx); assert.equal(read.details.output, "safe completion");
+		await execute(api, "spawn_agent", { task_name: "all", message: "all secret", backend: "pi" }, ctx); await turn(); runtimes.settlePi("/all", "all response"); await turn();
+		const all = await execute(api, "wait_all_agents", { targets: ["all"] }, ctx); assert.deepEqual(all.details.responses, [{ agent_name: "/all", backend: "pi", status: "completed", terminal_reason: undefined }]); assert.doesNotMatch(JSON.stringify(all.details), /all response|error/);
+		await execute(api, "spawn_agent", { task_name: "permission", message: "permission secret", backend: "cursor", cursor_model: "Auto", permission_mode: "agent" }, ctx); await new Promise((resolve) => setTimeout(resolve, 350));
+		const cursor = runtimes.cursor.get(root)!; const request = cursor.handlers.onRequest({ method: "session/request_permission", params: { title: "read", options: [{ optionId: "allow-once" }, { optionId: "reject-once" }] } }, cursor.token);
+		await turn(); const sent = api.sentMessages.find((entry: { message: any }) => entry.message.customType === "bstn_subagent_permission")!;
+		assert.equal(sent.message.content, "Cursor ACP subagent /permission requires permission: title=read."); assert.deepEqual(Object.keys(sent.message.details).sort(), ["agentName", "allowOnceOffered", "approvalId", "kind", "status", "summary", "turnId"].sort());
+		const permissionCard = textOf(api.messageRenderers.get("bstn_subagent_permission")!(sent.message, {}, theme)); assert.match(permissionCard, /permission required/); assert.doesNotMatch(permissionCard, /approvalId|allow-once|permission secret/);
+		await execute(api, "respond_agent_permission", { target: "permission", approval_id: sent.message.details.approvalId, decision: "approve" }, ctx); await request;
+	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }
+});
+
+test("Codex Pi children omit --tools, persist ordered conversion/guard extensions, and isolate resolver use", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-codex-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); const projections: ProjectionCapture = { pi: [], herdr: [] }; const conversionPath = join(root, "conversion"); const otherPath = join(root, "other"); const templates = join(root, ".pi", "pi-bstn-subagents", "agents"); await mkdir(conversionPath, { recursive: true }); await mkdir(otherPath); await mkdir(templates, { recursive: true }); const conversion = await realpath(conversionPath); const other = await realpath(otherPath); await writeFile(join(root, "config.json"), JSON.stringify({ trustedProjects: [root] }));
+	await writeFile(join(templates, "codex.md"), "---\nname: codex\nbackend: pi\nprovider: openai-codex\nmodel: codex-model\nextensions: ./conversion,./other\n---\nCodex task\n"); let calls = 0; let observer!: UnifiedTestObserver;
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; }, { projections, resolveCodexExtension: () => { calls++; return conversion; } })); const ctx = context("codex-parent", root, true);
+	try {
+		await execute(api, "spawn_agent", { task_name: "codex", message: "x", backend: "pi", agent_type: "codex" }, ctx); await turn(); assert.equal(calls, 2, "spawn and admission resolve exactly once each"); const pi = projections.pi.at(-1)!; assert.equal(pi.tools, undefined); assert.deepEqual((pi.extensionPaths as string[]).slice(0, 2), [conversion, other]); assert.match((pi.extensionPaths as string[]).at(-1)!, /codex-child-guard\.ts$/); const persistedPaths = [...pi.extensionPaths as string[]]; const manifest = JSON.parse(readFileSync(join(root, "runs", parentScopeKey("codex-parent"), "queue.manifest.json"), "utf8")); const persisted = Object.values(manifest.agents)[0] as any; assert.deepEqual(persisted.extensions, ["@howaboua/pi-codex-conversion", "./other", "pi-bstn-codex-child-guard"]); assert.deepEqual(persisted.extensionPaths, persistedPaths);
+		runtimes.settlePi("/codex"); await execute(api, "wait_agent", { targets: ["codex"] }, ctx); await writeFile(join(templates, "codex.md"), "---\nname: codex\nbackend: pi\nprovider: openai-codex\nmodel: codex-model\nextensions: ./other\n---\nchanged\n"); await execute(api, "send_message", { target: "codex", message: "follow" }, ctx); await turn(); assert.deepEqual(projections.pi.at(-1)?.extensionPaths, persistedPaths, "follow-up keeps the immutable persisted extension path");
+		const before = calls; await execute(api, "spawn_agent", { task_name: "plain", message: "x", backend: "pi", pi_model: "test/plain" }, ctx); await execute(api, "spawn_agent", { task_name: "cursor", message: "x", backend: "cursor" }, ctx); assert.equal(calls, before, "non-Codex Pi and Cursor never invoke the resolver");
+		await writeFile(join(templates, "bad-tools.md"), "---\nname: bad-tools\nbackend: pi\nprovider: openai-codex\nmodel: codex-model\ntools: read\n---\nx\n"); await assert.rejects(() => execute(api, "spawn_agent", { task_name: "bad", message: "x", backend: "pi", agent_type: "bad-tools" }, ctx), /sets tools/);
+	} finally { await observer.shutdown(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("Codex spawn fails absent conversion and queued admission terminal-fails when its resolver changes", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-codex-admission-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver; let resolved: string | undefined = join(root, "conversion");
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; }, { resolveCodexExtension: () => resolved })); const ctx = context("codex-admission", root);
+	try {
+		const absentApi = fakeApi(); let absentObserver!: UnifiedTestObserver; registerUnifiedSubagents(absentApi, dependencies(join(root, "absent"), [], new FakeRuntimes(), (value) => { absentObserver = value; }, { resolveCodexExtension: () => undefined })); await assert.rejects(() => execute(absentApi, "spawn_agent", { task_name: "missing", message: "x", backend: "pi", pi_model: "openai-codex/model" }, context("absent", root)), /require a valid global npm installation/); await absentObserver.shutdown();
+		for (let index = 0; index < 4; index++) await execute(api, "spawn_agent", { task_name: `slot-${index}`, message: "hold", backend: "pi" }, ctx); await turn(); const queued = await execute(api, "spawn_agent", { task_name: "queued-codex", message: "x", backend: "pi", pi_model: "openai-codex/model" }, ctx); assert.equal(queued.details.status, "queued"); resolved = undefined; runtimes.settlePi("/slot-0"); await turn(); await turn(); const failed = await execute(api, "list_agents", {}, ctx); const codex = failed.details.agents.find((agent: any) => agent.agent_name === "/queued-codex"); assert.equal(codex.agent_status, "failed"); assert.equal(codex.terminal_reason, "codex-extension-unavailable"); assert.equal(runtimes.pi.has("/queued-codex"), false);
+	} finally { await observer.shutdown(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("legacy v1-v3 settled Codex follow-ups atomically normalize mutable config without rewriting prior snapshots", async () => {
+	for (const version of [1, 2, 3] as const) {
+		const root = await mkdtemp(join(tmpdir(), `pi-unified-codex-v${version}-`)); const parent = `legacy-codex-v${version}`; const scope = join(root, "runs", parentScopeKey(parent)); const conversion = join(root, "global-conversion"); await mkdir(scope, { recursive: true }); await mkdir(conversion);
+		let manifest = createParentManifest(parent, "legacy-epoch", 1_000);
+		manifest = addAgentAtScope(manifest, scope, { id: "legacy", taskName: "legacy", canonicalName: "/legacy", backend: "pi", parentSessionId: parent, cwd: root, model: "openai-codex:model", provider: "openai-codex", modelId: "model", thinking: "low", tools: "read", skills: [], skillPaths: [], extensions: ["legacy-extension"], extensionPaths: ["/legacy-extension"], permissionMode: "agent", infoFile: "", logFile: "", responseFile: "", createdAt: 1_000, updatedAt: 1_000 }, 1_000);
+		const legacyAgent = manifest.agents.legacy!;
+		manifest = enqueueTurn(manifest, { id: "legacy-turn", agentId: "legacy", source: "initial", execution: { backend: "pi", cwd: legacyAgent.cwd, model: legacyAgent.model, provider: legacyAgent.provider, modelId: legacyAgent.modelId, thinking: legacyAgent.thinking, tools: legacyAgent.tools, skills: [], skillPaths: [], extensions: ["legacy-extension"], extensionPaths: ["/legacy-extension"], permissionMode: "agent", sessionFile: legacyAgent.sessionFile, prompt: "old private prompt", displayMessage: "old turn" }, createdAt: 1_000 });
+		manifest = transitionTurn(manifest, "legacy-turn", "terminal", 1_001, { status: "completed" });
+		const raw: any = JSON.parse(JSON.stringify(manifest)); raw.version = version; delete raw.agents.legacy.toolCallCount; if (version < 3) delete raw.agents.legacy.isolation;
+		await writeFile(join(scope, "queue.manifest.json"), JSON.stringify(raw));
+		const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver;
+		registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; }, { resolveCodexExtension: () => conversion }));
+		try {
+			await execute(api, "send_message", { target: "legacy", message: "new turn" }, context(parent, root)); await turn();
+			const persisted = JSON.parse(readFileSync(join(scope, "queue.manifest.json"), "utf8")); const agent = persisted.agents.legacy; const old = persisted.turns["legacy-turn"]; const follow = persisted.turns[agent.currentTurnId];
+			assert.equal(persisted.version, 4); assert.equal(agent.tools, undefined); assert.deepEqual(agent.extensions, ["@howaboua/pi-codex-conversion", "legacy-extension", "pi-bstn-codex-child-guard"]); assert.deepEqual(agent.extensionPaths.slice(0, 2), [conversion, "/legacy-extension"]); assert.match(agent.extensionPaths[2], /codex-child-guard\.ts$/);
+			assert.equal(old.execution.tools, "read"); assert.deepEqual(old.execution.extensions, ["legacy-extension"]); assert.equal(follow.execution.tools, undefined); assert.deepEqual(follow.execution.extensions, agent.extensions); assert.ok(runtimes.pi.has("/legacy"));
+		} finally { await observer.shutdown(); await rm(root, { recursive: true, force: true }); }
+	}
+});
+
+test("Codex extension startup failures retain only the fixed safe text in manifest and projection", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-codex-safe-error-")); const api = fakeApi(); let observer!: UnifiedTestObserver;
+	registerUnifiedSubagents(api, dependencies(root, [], new FakeRuntimes(), (value) => { observer = value; }, { failPiStart: new Error(PI_EXTENSION_STARTUP_FAILURE), resolveCodexExtension: () => join(root, "conversion") })); const ctx = context("codex-safe-error", root);
+	try {
+		await execute(api, "spawn_agent", { task_name: "safe", message: "x", backend: "pi", pi_model: "openai-codex/model" }, ctx); await turn();
+		const scope = join(root, "runs", parentScopeKey("codex-safe-error")); const manifest = JSON.parse(readFileSync(join(scope, "queue.manifest.json"), "utf8")); const agent = manifest.agents[Object.keys(manifest.agents)[0]!]; const currentTurn = manifest.turns[agent.currentTurnId]; const projection = JSON.parse(readFileSync(agent.infoFile, "utf8"));
+		assert.equal(currentTurn.error, PI_EXTENSION_STARTUP_FAILURE); assert.equal(projection.error, PI_EXTENSION_STARTUP_FAILURE); assert.doesNotMatch(JSON.stringify({ currentTurn, projection }), /secret-bearing extension error/);
+	} finally { await observer.shutdown(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("persistent subagent widget renders between the prompt editor and footer", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-widget-placement-"));
+	const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi();
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, () => {}, { resolveCodexExtension: () => join(root, "fake-codex-conversion") }));
+	const widgetCalls: Array<{ key: string; content: unknown; options?: unknown }> = [];
+	let registrationIndex = -1;
+	const ctx = {
+		...context("parent-widget-placement", root),
+		mode: "tui",
+		ui: {
+			setWidget(key: string, content: unknown, options?: unknown) { widgetCalls.push({ key, content, options }); },
+			notify() {},
+		},
+	};
+	try {
+		await api.emit("session_start", {}, ctx);
+		ctx.model = { provider: "openai-codex", id: "gpt-5.6-terra" };
+		await execute(api, "spawn_agent", { task_name: "review", message: "hold", backend: "pi", pi_thinking: "high" }, ctx);
+		const registration = [...widgetCalls].reverse().find((call) => typeof call.content === "function");
+		assert.ok(registration);
+		registrationIndex = widgetCalls.indexOf(registration);
+		assert.equal(registration.key, "pi-bstn-subagents:agents");
+		assert.deepEqual(registration.options, { placement: "belowEditor" });
+		const component = (registration.content as (tui: unknown, theme: any) => { render(width: number): string[] })({}, { fg(_color: string, text: string) { return text; }, bold(text: string) { return text; } });
+		const lines = component.render(200); assert.equal(lines[0], "Agents"); assert.match(lines[1]!, /^● \/review openai-codex:gpt-5\.6-terra:high · running · \d+[smh].* · 0 tool calls$/); assert.equal(lines[2], "  ↳ Starting");
+	} finally {
+		await api.emit("session_shutdown");
+		assert.ok(widgetCalls.slice(registrationIndex + 1).some((call) => call.content === undefined));
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("truncated automatic, wait, and read cards use display text without generated response paths", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-truncated-cards-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi();
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, () => {})); const ctx = context("parent-truncated-cards", root);
+	const theme = { fg(_color: string, text: string) { return text; }, bold(text: string) { return text; } }; const textOf = (component: { render(width: number): string[] }) => component.render(200).join("\n");
+	const huge = Array.from({ length: 20_000 }, (_, index) => `line-${index}`).join("\n");
+	try {
+		await execute(api, "spawn_agent", { task_name: "automatic-truncated", message: "x", backend: "pi" }, ctx); await turn(); runtimes.settlePi("/automatic-truncated", huge); await turn();
+		const automatic = api.sentMessages.find((entry: { message: any }) => entry.message.customType === "bstn_subagent_completion")!;
+		assert.match(automatic.message.content, /Full response:/); assert.doesNotMatch(automatic.message.details.output, /Full response:|\.responses\//);
+		const completionCard = textOf(api.messageRenderers.get("bstn_subagent_completion")!(automatic.message, { expanded: true }, theme)); assert.doesNotMatch(completionCard, /Full response:|\.responses\//);
+		await execute(api, "spawn_agent", { task_name: "wait-truncated", message: "x", backend: "pi" }, ctx); await turn(); const waiting = execute(api, "wait_agent", { targets: ["wait-truncated"] }, ctx); runtimes.settlePi("/wait-truncated", huge); const waited = await waiting;
+		assert.doesNotMatch(waited.details.output, /Full response:|\.responses\//); const waitCard = textOf(api.tools.get("wait_agent")!.renderResult!({ isError: false, details: waited.details }, { expanded: true }, theme)); assert.doesNotMatch(waitCard, /Full response:|\.responses\//);
+		const read = await execute(api, "read_agent_response", { target: "wait-truncated" }, ctx); assert.doesNotMatch(read.details.output, /Full response:|\.responses\//); const readCard = textOf(api.tools.get("read_agent_response")!.renderResult!({ isError: false, details: read.details }, { expanded: true }, theme)); assert.doesNotMatch(readCard, /Full response:|\.responses\//);
+	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }
+});
+
+test("accepted Pi and Cursor tool starts persist one count per ID and per fresh turn", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-unified-tool-count-")); const events: string[] = []; const runtimes = new FakeRuntimes(); const api = fakeApi(); let observer!: UnifiedTestObserver;
+	registerUnifiedSubagents(api, dependencies(root, events, runtimes, (value) => { observer = value; })); const ctx = context("parent-tool-count", root);
+	const count = (name: string) => observer.snapshot("parent-tool-count").agents.find((agent) => agent.agentName === name)?.toolCallCount;
+	try {
+		await execute(api, "spawn_agent", { task_name: "pi-count", message: "x", backend: "pi" }, ctx); await turn();
+		const pi = runtimes.pi.get("/pi-count")!; pi.handlers.onEvent({ type: "tool_start", id: "same", name: "read" }, pi.token); pi.handlers.onEvent({ type: "tool_end", id: "same" }, pi.token); pi.handlers.onEvent({ type: "tool_start", id: "same", name: "read" }, pi.token); pi.handlers.onEvent({ type: "tool_start", id: "second", name: "bash" }, pi.token);
+		assert.equal(count("/pi-count"), 2); pi.handlers.onEvent({ type: "tool_start", id: "stale", name: "bash" }, "stale-token"); assert.equal(count("/pi-count"), 2);
+		await execute(api, "interrupt_agent", { target: "pi-count" }, ctx); assert.equal(count("/pi-count"), 2, "synthetic terminal ends never count");
+		await execute(api, "spawn_agent", { task_name: "pi-follow", message: "x", backend: "pi" }, ctx); await turn(); runtimes.emitPi("/pi-follow", { type: "tool_start", id: "same", name: "read" }); assert.equal(count("/pi-follow"), 1); runtimes.settlePi("/pi-follow"); await turn(); await execute(api, "send_message", { target: "pi-follow", message: "again" }, ctx); await turn(); runtimes.emitPi("/pi-follow", { type: "tool_start", id: "same", name: "read" }); assert.equal(count("/pi-follow"), 2, "fresh follow-up may reuse an ID");
+		await execute(api, "spawn_agent", { task_name: "cursor-count", message: "x", backend: "cursor", cursor_model: "Auto" }, ctx); await new Promise((resolve) => setTimeout(resolve, 350)); const cursor = runtimes.cursor.get(root)!;
+		const update = { method: "session/update", params: { update: { sessionUpdate: "tool_call", toolCallId: "cursor-same", title: "read" } } }; cursor.handlers.onNotification(update, cursor.token); cursor.handlers.onNotification(update, cursor.token); cursor.handlers.onNotification({ method: "session/update", params: { update: { sessionUpdate: "tool_call_update", title: "read" } } }, cursor.token); assert.equal(count("/cursor-count"), 1);
+	} finally { await api.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); }
 });

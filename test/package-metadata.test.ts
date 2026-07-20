@@ -35,11 +35,12 @@ test("peerDependencies follow Pi package guidance", () => {
 		"@earendil-works/pi-ai",
 		"@earendil-works/pi-coding-agent",
 		"@earendil-works/pi-tui",
-		"typebox",
 	]) {
-		assert.equal(peers[name], "*", `peer ${name} should be *`);
+		assert.equal(peers[name], ">=0.80.7", `peer ${name} should require Pi 0.80.7`);
 		assert.equal(meta?.[name]?.optional, true, `peerDependenciesMeta.${name}.optional`);
 	}
+	assert.equal(peers.typebox, "*");
+	assert.equal(meta?.typebox?.optional, true, "peerDependenciesMeta.typebox.optional");
 });
 
 test("ACP clientInfo version matches package.json", () => {

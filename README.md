@@ -4,10 +4,17 @@ A [Pi](https://pi.dev) package for session-scoped **Pi** and **Cursor ACP** suba
 
 ## Requirements
 
-- Pi `>=0.80.4`
+- Pi `>=0.80.7`
 - Node.js `>=22.19`
 - [Herdr](https://herdr.dev), with Pi running in a Herdr pane
 - Cursor agent CLI (`agent acp`) for the `cursor` backend
+- For Pi children whose resolved provider is exactly `openai-codex`, install the required global conversion peer:
+
+```bash
+pi install npm:@howaboua/pi-codex-conversion
+```
+
+The Codex conversion is intentionally resolved only from Pi's global npm installation; project-local and Git installs are not used for child inheritance.
 
 ## Install
 
@@ -145,7 +152,20 @@ Both Pi settings are optional and resolve independently:
 
 `pi_thinking` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. `pi_model` uses exact `provider/model-id` format. It is trimmed and split at the first slash, so later slashes and colons remain in the model ID (for example, `openrouter/anthropic/claude:beta`). Explicit and template model pairs must exactly match `ctx.modelRegistry.find(provider, modelId)`. Inherited parent models are not revalidated. A complete explicit or template model works without an active parent model; the parent model is required only when model selection falls through to inheritance.
 
+Without an explicit template tool list, Pi children inherit the parent's active built-in Pi tools. If
+the parent harness exposes only custom tool names, children fall back to Pi's full built-in coding set:
+`read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Native file edits remain available without
+inheriting parent-only orchestration tools.
+
 Persisted metadata and UI continue to display Pi models as `provider:modelId`.
+
+### OpenAI Codex Pi children
+
+The special Codex path applies **only** when the resolved Pi provider is exactly `openai-codex` (whether selected explicitly, by template, or inherited from the parent). It requires the global npm peer installed with `pi install npm:@howaboua/pi-codex-conversion`; the child validates that package and its declared extension entries before it is queued and again when it is admitted.
+
+That installed extension owns the complete Codex configuration: its provider rewriting, prompt adapter, sessions, UI, and all Codex tools (`exec_command`, `write_stdin`, `apply_patch`, `web_run`, `imagegen`, and `view_image`). Pi's `--tools` flag is deliberately omitted for these children, because passing it prevents those Codex tools from registering. A selected Codex template must not set `tools`; such templates are rejected rather than silently changing Codex behavior.
+
+The canonical installed extension path is persisted for follow-up turns. Package content is not content-snapshotted: an in-place update at the same path is used by later launches, while a missing or moved package causes queued admission to fail terminally. The installed conversion must also remain compatible with the runtime Pi version as its peer.
 
 ## Workflow
 
@@ -200,7 +220,7 @@ Runtime data is stored under:
     └── <id>.session.jsonl   # Pi backend
 ```
 
-The private manifest is the sole lifecycle authority. It is currently schema v3 and strictly upgrades v1/v2 manifests under the manifest lock; old journals remain readable. `.info.json` is regenerated from it on writes and reads for compatibility with existing viewers; deleting a projection does not lose state. A corrupt manifest fails closed rather than guessing from projections. Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
+The private manifest is the sole lifecycle authority. It is currently schema v4 and strictly upgrades v1/v2/v3 manifests under the manifest lock; old journals remain readable. `.info.json` is regenerated from it on writes and reads for compatibility with existing viewers; deleting a projection does not lose state. A corrupt manifest fails closed rather than guessing from projections. Pi children reopen their persisted Pi session. Cursor sessions reconnect through ACP `session/load` when supported. Cursor CLI `2026.07.09` advertises `loadSession`, but not ACP resume/close, so closing terminates the ACP process.
 
 Optional `config.json`:
 
@@ -232,7 +252,6 @@ description: Focused code reviewer
 provider: openai-codex
 model: gpt-5.6-sol
 thinking: high
-tools: read,bash,grep,find,ls
 skills: web-investigate
 extensions: @scope/pi-extra-tools
 hint: Give this reviewer exact paths and a narrow scope.
@@ -280,7 +299,7 @@ Every newly created backend gets a background Herdr **Run Ledger** viewer tab. T
 - Inside the native ledger, use `j/k`, arrows, page keys, or `g/G` to inspect semantic blocks; detached views count new blocks until `G` resumes follow mode. Left/Right changes agents.
 - Enter composes a Pi steering message, a Cursor replacement correction, or a settled follow-up according to the visible state. `x` twice interrupts active work. Historical records are read-only.
 - Raw diagnostics are never the native default. Press `r` twice to acknowledge that raw logs may contain prompts, reasoning, commands, output, paths, and secrets; press `r` again to return to the semantic ledger.
-- The persistent editor widget uses the same two-line format and elapsed runtime, retaining the `[pi]`/`[cursor]` backend prefix. Pi metadata shows `model · thinking <level> · status · elapsed` (or `thinking unknown` for legacy records); Cursor metadata omits thinking. Activity phases include `Thinking`, `Writing response`, `Tool · bash`, and `Awaiting approval`.
+- The persistent `Agents` widget sits between the prompt and footer. Pi rows show `model:thinking · status · elapsed · N tool calls`; Cursor rows omit the thinking suffix. Elapsed time uses compact forms such as `17s`, `2m17s`, or `1h02m17s`. Tool-call totals are durable across follow-ups and reloads. Activity phases include `Thinking`, `Writing response`, `Tool · bash`, and `Awaiting approval`.
 - In the overlay: Left/Right changes agents, `j`/`k` scrolls, `g`/`G` jumps, and `q` closes.
 
 The parent Herdr pane remains `working` while its attached parent manifest has queued, admitted, or running work. It releases only when that parent has no outstanding turn.

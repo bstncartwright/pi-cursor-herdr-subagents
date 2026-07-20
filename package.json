@@ -43,9 +43,9 @@
 		"test": "node --test --experimental-strip-types test/*.test.ts"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "*",
+		"@earendil-works/pi-ai": ">=0.80.7",
+		"@earendil-works/pi-coding-agent": ">=0.80.7",
+		"@earendil-works/pi-tui": ">=0.80.7",
 		"typebox": "*"
 	},
 	"peerDependenciesMeta": {
@@ -63,9 +63,9 @@
 		}
 	},
 	"devDependencies": {
-		"@earendil-works/pi-ai": "0.80.6",
-		"@earendil-works/pi-coding-agent": "0.80.6",
-		"@earendil-works/pi-tui": "0.80.6",
+		"@earendil-works/pi-ai": "0.80.7",
+		"@earendil-works/pi-coding-agent": "0.80.7",
+		"@earendil-works/pi-tui": "0.80.7",
 		"@types/node": "^24.10.0",
 		"typebox": "1.1.38",
 		"typescript": "^5.9.3"

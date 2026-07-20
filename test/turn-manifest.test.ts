@@ -7,7 +7,7 @@ import test from "node:test";
 import {
 	DEFAULT_ACTIVE_TURN_LIMIT, MAX_LOCK_BYTES, MAX_MANIFEST_BYTES, TURN_MANIFEST_FILE, TURN_MANIFEST_LOCK_FILE, TURN_MANIFEST_RECLAIM_FILE, TurnManifestStore,
 	addAgent, addAgentAtScope, admitFifo, canonicalAgentPaths, closeAgent, createParentManifest, enqueueTurn, materializeAgentProjections,
-	migrateLegacyInfo, parseParentManifest, reconcileManifest, replaceCursorTurn, touchTurn, transitionTurn, updateAgentRuntimeResources, updateAgentWorktree,
+	migrateLegacyInfo, normalizeSettledPiAgentExtensions, parseParentManifest, reconcileManifest, replaceCursorTurn, touchTurn, transitionTurn, incrementAgentToolCallCount, updateAgentRuntimeResources, updateAgentWorktree,
 	type AddAgentInput, type ResolvedExecutionSnapshot,
 } from "../extensions/turn-manifest.ts";
 
@@ -34,7 +34,7 @@ test("manifest parsing is strict, versioned, corrupt-fail-closed, and contains n
 	let { manifest, ids } = seeded(); manifest = queue(manifest, ids[0]!, "turn-a");
 	assert.deepEqual(parseParentManifest(manifest), manifest);
 	for (const corrupt of [
-		mutateJson(manifest, (value) => { value.version = 4; }),
+		mutateJson(manifest, (value) => { value.version = 5; }),
 		mutateJson(manifest, (value) => { value.extra = true; }),
 		mutateJson(manifest, (value) => { value.turns["turn-a"].sequence = 0.1; }),
 		mutateJson(manifest, (value) => { value.agents[ids[0]].currentTurnId = "missing"; }),
@@ -134,6 +134,25 @@ test("projection dynamically represents queued/admitted/running/terminal and clo
 	assert.equal(materializeAgentProjections(manifest, { readResponse: (reference) => reference.path === manifest.agents[ids[0]!]!.responseFile ? "read privately" : undefined })[0]!.finalResponse, "read privately");
 	manifest.agents[ids[0]!]!.closed = true; manifest.agents[ids[0]!]!.closedAt = now + 4; manifest.agents[ids[0]!]!.closeReason = "explicit-close";
 	assert.equal(materializeAgentProjections(manifest)[0]!.status, "closed");
+});
+
+test("settled Codex normalization preserves only the permitted terminal snapshot differences", () => {
+	let { manifest, ids } = seeded(); const id = ids[0]!; const codex = manifest.agents[id]!;
+	Object.assign(codex, { provider: "openai-codex", modelId: "model", model: "openai-codex:model" });
+	manifest = enqueueTurn(manifest, { id: "legacy-codex", agentId: id, source: "initial", execution: { backend: "pi", cwd: codex.cwd, model: codex.model, provider: codex.provider, modelId: codex.modelId, thinking: codex.thinking, tools: codex.tools, skills: [...codex.skills], skillPaths: [...codex.skillPaths], extensions: [...codex.extensions], extensionPaths: [...codex.extensionPaths], permissionMode: codex.permissionMode, sessionFile: codex.sessionFile, prompt: "private:legacy", displayMessage: "legacy" }, createdAt: now });
+	manifest = transitionTurn(manifest, "legacy-codex", "terminal", now + 1, { status: "completed" });
+	const snapshot = JSON.parse(JSON.stringify(manifest.turns["legacy-codex"]!.execution));
+	const normalized = normalizeSettledPiAgentExtensions(manifest, id, ["@howaboua/pi-codex-conversion", "pi-bstn-codex-child-guard"], ["/global/conversion", "/guard/codex-child-guard.ts"], now + 2);
+	assert.equal(normalized.agents[id]!.tools, undefined);
+	assert.deepEqual(normalized.agents[id]!.extensions, ["@howaboua/pi-codex-conversion", "pi-bstn-codex-child-guard"]);
+	assert.deepEqual(normalized.turns["legacy-codex"]!.execution, snapshot);
+	assert.doesNotThrow(() => parseParentManifest(normalized), "old Codex tools/extensions remain an allowed immutable snapshot");
+	for (const field of ["cwd", "model"] as const) assert.throws(() => parseParentManifest(mutateJson(normalized, (value) => { value.turns["legacy-codex"].execution[field] = `corrupt-${field}`; })), /cwd\/model/);
+	let nonCodex = seeded(); nonCodex.manifest = queue(nonCodex.manifest, nonCodex.ids[0]!, "plain-terminal"); nonCodex.manifest = transitionTurn(nonCodex.manifest, "plain-terminal", "terminal", now + 1, { status: "completed" });
+	assert.throws(() => parseParentManifest(mutateJson(nonCodex.manifest, (value) => { value.turns["plain-terminal"].execution.tools = "bash"; })), /Pi config/);
+	assert.throws(() => normalizeSettledPiAgentExtensions(nonCodex.manifest, nonCodex.ids[0]!, ["@howaboua/pi-codex-conversion", "pi-bstn-codex-child-guard"], ["/global/conversion", "/guard/codex-child-guard.ts"], now + 2), /not an openai-codex/);
+	assert.throws(() => normalizeSettledPiAgentExtensions(manifest, id, ["name"], [], now + 2), /misaligned/);
+	assert.throws(() => normalizeSettledPiAgentExtensions(seeded().manifest, id, [], [], now + 2), /not an openai-codex/);
 });
 
 test("reconciliation terminalizes prior epoch work without auto-resume", () => {
@@ -340,15 +359,18 @@ test("store rejects oversized manifest and lock data before parsing", async () =
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("v1/v2 upgrade to strict v3 and Pi-only metrics reject Cursor and payload fields", () => {
+test("v1/v2/v3 upgrade to strict v4 and Pi-only metrics reject Cursor and payload fields", () => {
 	let { manifest, ids } = seeded(); manifest = queue(manifest, ids[0]!, "turn-a");
-	const v2: any = JSON.parse(JSON.stringify(manifest)); v2.version = 2; for (const value of Object.values<any>(v2.agents)) delete value.isolation;
-	const upgradedV2 = parseParentManifest(v2); assert.equal(upgradedV2.version, 3); assert.equal(upgradedV2.agents[ids[0]!]!.isolation, "shared");
+	const v3: any = JSON.parse(JSON.stringify(manifest)); v3.version = 3; for (const value of Object.values<any>(v3.agents)) delete value.toolCallCount;
+	const upgradedV3 = parseParentManifest(v3); assert.equal(upgradedV3.version, 4); assert.equal(upgradedV3.agents[ids[0]!]!.toolCallCount, 0);
+	const v2: any = JSON.parse(JSON.stringify(v3)); v2.version = 2; for (const value of Object.values<any>(v2.agents)) delete value.isolation;
+	const upgradedV2 = parseParentManifest(v2); assert.equal(upgradedV2.version, 4); assert.equal(upgradedV2.agents[ids[0]!]!.isolation, "shared"); assert.equal(upgradedV2.agents[ids[0]!]!.toolCallCount, 0);
 	const v1: any = JSON.parse(JSON.stringify(v2)); v1.version = 1;
 	const upgraded = parseParentManifest(v1);
-	assert.equal(upgraded.version, 3);
+	assert.equal(upgraded.version, 4); assert.equal(upgraded.agents[ids[0]!]!.toolCallCount, 0);
 	assert.throws(() => parseParentManifest({ ...v1, agents: { ...v1.agents, [ids[0]!]: { ...v1.agents[ids[0]!], metrics: {} } } }), /v1 manifest/);
 	assert.throws(() => parseParentManifest({ ...v2, agents: { ...v2.agents, [ids[0]!]: { ...v2.agents[ids[0]!], worktree: {} } } }), /v2 manifest/);
+	for (const legacy of [v1, v2, v3]) assert.throws(() => parseParentManifest({ ...legacy, agents: { ...legacy.agents, [ids[0]!]: { ...legacy.agents[ids[0]!], toolCallCount: 1 } } }), /newer version/);
 	const metrics = { sampledAt: now, inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, cost: 0, contextUsage: { tokens: null, contextWindow: 100, percent: null }, compactionCount: 1 };
 	assert.doesNotThrow(() => parseParentManifest({ ...upgraded, agents: { ...upgraded.agents, [ids[0]!]: { ...upgraded.agents[ids[0]!], metrics } } }));
 	assert.throws(() => parseParentManifest({ ...upgraded, agents: { ...upgraded.agents, [ids[0]!]: { ...upgraded.agents[ids[0]!], metrics: { ...metrics, sessionId: "forbidden" } } } }), /unsupported/);
@@ -363,4 +385,22 @@ test("managed worktree identity is strict, projected, and lifecycle-updated narr
 	assert.throws(() => parseParentManifest(mutateJson(manifest, (value) => { value.agents[id].cwd = "/repo"; value.turns["worktree-turn"].execution.cwd = "/repo"; })), /cwd must equal worktree cwd/);
 	assert.throws(() => parseParentManifest(mutateJson(manifest, (value) => { value.agents[id].worktree.branch = "user-owned"; })), /branch is not package-owned/);
 	assert.throws(() => parseParentManifest(mutateJson(manifest, (value) => { value.agents[id].isolation = "shared"; })), /must not have worktree/);
+});
+
+
+test("tool call count is required v4 state and increments only for its current turn", () => {
+	let { manifest, ids } = seeded(); const id = ids[0]!; manifest = queue(manifest, id, "turn-a");
+	assert.equal(manifest.agents[id]!.toolCallCount, 0); assert.equal(materializeAgentProjections(manifest)[0]!.toolCallCount, 0);
+	for (const change of [
+		(value: any) => { delete value.agents[id].toolCallCount; },
+		(value: any) => { value.agents[id].toolCallCount = -1; },
+		(value: any) => { value.agents[id].toolCallCount = 0.5; },
+		(value: any) => { value.agents[id].toolCallCount = Number.MAX_SAFE_INTEGER + 1; },
+		(value: any) => { value.agents[id].unexpected = 1; },
+	]) assert.throws(() => parseParentManifest(mutateJson(manifest, change)), /Invalid turn manifest/);
+	assert.throws(() => incrementAgentToolCallCount(manifest, id, "turn-a", now + 1), /not running/);
+	manifest = transitionTurn(manifest, "turn-a", "admitted", now + 1); assert.throws(() => incrementAgentToolCallCount(manifest, id, "turn-a", now + 2), /not running/);
+	manifest = transitionTurn(manifest, "turn-a", "running", now + 2);
+	const incremented = incrementAgentToolCallCount(manifest, id, "turn-a", now + 3); assert.equal(incremented.agents[id]!.toolCallCount, 1); assert.equal(incremented.agents[id]!.updatedAt, now + 3); assert.equal(incremented.turns["turn-a"]!.lastActivityAt, now + 3);
+	assert.throws(() => incrementAgentToolCallCount(manifest, id, "other", now + 1), /current turn/);
 });

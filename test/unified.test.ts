@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	agentActivitySummary,
+	codexExtensionPairs,
 	compactActivityText,
 	formatElapsed,
+	formatWidgetElapsed,
 	formatPersistentWidgetMetadata,
 	JsonlDecoder,
 	normalizeCursorToolUpdate,
@@ -43,6 +45,19 @@ test("unified agent identities are parent-session scoped", () => {
 	assert.notEqual(taskStorageKey("review/api"), taskStorageKey("review__api"));
 	assert.equal(normalizeTaskName("/review/api/"), "review/api");
 	assert.throws(() => normalizeTaskName("../escape"), /task_name/);
+});
+
+test("Codex extension normalization removes same-name and canonical-path conversion aliases without disturbing pairs", () => {
+	const global = "/pi/npm/node_modules/@howaboua/pi-codex-conversion";
+	const pairs = codexExtensionPairs(
+		["first", "@howaboua/pi-codex-conversion", "path-alias", "second", "@howaboua/pi-codex-conversion"],
+		["/first", "/project/node_modules/@howaboua/pi-codex-conversion", global, "/second", "/another-local-copy"],
+		global,
+	);
+	assert.deepEqual(pairs.names, ["@howaboua/pi-codex-conversion", "first", "second", "pi-bstn-codex-child-guard"]);
+	assert.deepEqual(pairs.paths.slice(0, 3), [global, "/first", "/second"]);
+	assert.match(pairs.paths[3]!, /codex-child-guard\.ts$/);
+	assert.throws(() => codexExtensionPairs(["unpaired"], [], global), /misaligned/);
 });
 
 test("agent templates parse explicit backend-specific settings", () => {
@@ -260,7 +275,7 @@ test("Pi tool inheritance excludes parent-only extension tools", () => {
 			{ name: "spawn_agent", sourceInfo: { source: "pi-bstn-subagents" } },
 		],
 	);
-	assert.equal(selected, "read,bash,grep,find,ls");
+	assert.equal(selected, "read,write,edit,bash,grep,find,ls");
 	assert.equal(
 		selectInheritedPiTools(
 			["read", "bash", "spawn_agent"],
@@ -317,13 +332,13 @@ test("persistent widget metadata formats Pi thinking and legacy unknown exactly"
 		thinking: "high",
 		status: "running",
 		createdAt: 1_000,
-	}, now), "[pi] openai-codex:gpt-5.6-terra · thinking high · running · 1:05");
+	}, now), "openai-codex:gpt-5.6-terra:high · running · 1m5s · 0 tool calls");
 	assert.equal(formatPersistentWidgetMetadata({
 		backend: "pi",
 		model: "legacy:model",
 		status: "completed",
 		createdAt: 1_000,
-	}, now), "[pi] legacy:model · thinking unknown · completed · 1:05");
+	}, now), "legacy:model:unknown · completed · 1m5s · 0 tool calls");
 });
 
 test("persistent widget metadata omits stale thinking for Cursor exactly", () => {
@@ -333,7 +348,7 @@ test("persistent widget metadata omits stale thinking for Cursor exactly", () =>
 		thinking: "max",
 		status: "failed",
 		createdAt: 1_000,
-	}, 66_000), "[cursor] Grok 4.5 High · failed · 1:05");
+	}, 66_000), "Grok 4.5 High · failed · 1m5s · 0 tool calls");
 });
 
 
@@ -409,4 +424,11 @@ test("Pi compaction hints use result numbers and never retain textual or identif
 	assert.deepEqual(normalizePiCompactionEvent({ type: "compaction_end", errorMessage: "private error", result: { tokensBefore: 9 } }), { type: "compaction", state: "failed", tokensBefore: 9 });
 	assert.deepEqual(normalizePiCompactionEvent({ type: "compaction_end", aborted: true, result: { estimatedTokensAfter: 3 } }), { type: "compaction", state: "aborted", estimatedTokensAfter: 3 });
 	assert.deepEqual(normalizePiCompactionEvent({ type: "compaction_end" }), { type: "compaction", state: "failed" });
+});
+
+
+test("widget elapsed formatter uses compact second, minute, and hour forms", () => {
+	assert.equal(formatWidgetElapsed(1_000, 0), "0s"); assert.equal(formatWidgetElapsed(1_000, 18_000), "17s"); assert.equal(formatWidgetElapsed(0, 137_000), "2m17s"); assert.equal(formatWidgetElapsed(0, 3_737_000), "1h02m17s");
+	assert.equal(formatPersistentWidgetMetadata({ backend: "pi", model: "openai-codex:gpt-5.6-terra", thinking: "high", status: "running", createdAt: 0, toolCallCount: 7 }, 137_000), "openai-codex:gpt-5.6-terra:high · running · 2m17s · 7 tool calls");
+	assert.equal(formatPersistentWidgetMetadata({ backend: "cursor", model: "Auto", status: "running", createdAt: 0, toolCallCount: 1 }, 0), "Auto · running · 0s · 1 tool call");
 });

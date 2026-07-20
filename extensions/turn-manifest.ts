@@ -6,7 +6,7 @@
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-export const TURN_MANIFEST_VERSION = 3 as const;
+export const TURN_MANIFEST_VERSION = 4 as const;
 export const TURN_MANIFEST_FILE = "queue.manifest.json";
 export const TURN_MANIFEST_LOCK_FILE = ".lock";
 export const TURN_MANIFEST_RECLAIM_FILE = ".lock.reclaim";
@@ -130,9 +130,11 @@ export interface ManifestAgent {
 	closeReason?: string;
 	/** Pi-only numeric session totals; never session ids/files or text. */
 	metrics?: AgentMetrics;
+	/** Durable accepted unique tool-start count across turns. */
+	toolCallCount: number;
 }
 
-export interface ParentManifestV3 {
+export interface ParentManifestV4 {
 	version: typeof TURN_MANIFEST_VERSION;
 	parentSessionId: string;
 	epoch: string;
@@ -141,8 +143,8 @@ export interface ParentManifestV3 {
 	agents: Record<string, ManifestAgent>;
 	turns: Record<string, ManifestTurn>;
 }
-/** Compatibility type name for existing internal callers; emitted schema is v3. */
-export type ParentManifestV1 = ParentManifestV3;
+/** Compatibility type name for existing internal callers; emitted schema is v4. */
+export type ParentManifestV1 = ParentManifestV4;
 
 export interface AgentInfoProjection {
 	id: string;
@@ -189,9 +191,10 @@ export interface AgentInfoProjection {
 	response?: ResponseReference;
 	finalResponse?: string;
 	metrics?: AgentMetrics;
+	toolCallCount: number;
 }
 
-export interface AddAgentInput extends Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed" | "closedAt" | "closeReason" | "isolation"> {
+export interface AddAgentInput extends Omit<ManifestAgent, "nextOrdinal" | "currentTurnId" | "closed" | "closedAt" | "closeReason" | "isolation" | "toolCallCount"> {
 	isolation?: IsolationMode;
 	closed?: boolean;
 	closedAt?: number;
@@ -277,14 +280,21 @@ export function parseParentManifest(input: unknown, options: ParseManifestOption
 	const root = { ...object(input, "manifest") };
 	const allowedRoot = ["version", "parentSessionId", "epoch", "nextSequence", "updatedAt", "agents", "turns"];
 	exactKeys(root, allowedRoot, "manifest");
-	// v1 had no metrics; v1/v2 had no isolation/worktree state.
-	if (root.version === 1) {
-		for (const rawAgent of Object.values(object(root.agents, "manifest.agents"))) if (rawAgent && typeof rawAgent === "object" && (Object.prototype.hasOwnProperty.call(rawAgent, "metrics") || Object.prototype.hasOwnProperty.call(rawAgent, "isolation") || Object.prototype.hasOwnProperty.call(rawAgent, "worktree"))) fail("v1 manifest contains fields from a newer version");
-	} else if (root.version === 2) {
-		for (const rawAgent of Object.values(object(root.agents, "manifest.agents"))) if (rawAgent && typeof rawAgent === "object" && (Object.prototype.hasOwnProperty.call(rawAgent, "isolation") || Object.prototype.hasOwnProperty.call(rawAgent, "worktree"))) fail("v2 manifest contains worktree fields");
+	// v1 had no metrics; v1/v2 had no isolation/worktree state; v1/v2/v3 had no tool count.
+	const oldVersions = root.version === 1 || root.version === 2 || root.version === 3;
+	if (oldVersions) {
+		for (const rawAgent of Object.values(object(root.agents, "manifest.agents"))) {
+			const agent = object(rawAgent, "manifest agent");
+			if (Object.prototype.hasOwnProperty.call(agent, "toolCallCount")) fail(`v${String(root.version)} manifest contains fields from a newer version`);
+			if (root.version === 1 && (Object.prototype.hasOwnProperty.call(agent, "metrics") || Object.prototype.hasOwnProperty.call(agent, "isolation") || Object.prototype.hasOwnProperty.call(agent, "worktree"))) fail("v1 manifest contains fields from a newer version");
+			if (root.version === 2 && (Object.prototype.hasOwnProperty.call(agent, "isolation") || Object.prototype.hasOwnProperty.call(agent, "worktree"))) fail("v2 manifest contains worktree fields");
+		}
 	} else if (root.version !== TURN_MANIFEST_VERSION) fail(`version ${String(root.version)} is unsupported`);
-	if (root.version === 1 || root.version === 2) {
-		root.agents = Object.fromEntries(Object.entries(object(root.agents, "manifest.agents")).map(([id, raw]) => [id, { ...object(raw, `manifest.agents.${id}`), isolation: "shared" }]));
+	if (oldVersions) {
+		root.agents = Object.fromEntries(Object.entries(object(root.agents, "manifest.agents")).map(([id, raw]) => {
+			const agent = object(raw, `manifest.agents.${id}`);
+			return [id, { ...agent, ...(root.version === 1 || root.version === 2 ? { isolation: "shared" } : {}), toolCallCount: 0 }];
+		}));
 		root.version = TURN_MANIFEST_VERSION;
 	}
 	const manifest: ParentManifestV1 = {
@@ -354,14 +364,14 @@ function parseWorktree(raw: unknown, path: string): ManagedWorktreeState | undef
 }
 function parseAgent(raw: unknown, path: string): ManifestAgent {
 	const value = object(raw, path);
-	exactKeys(value, ["id", "taskName", "canonicalName", "backend", "parentSessionId", "parentSessionFile", "agentType", "isolation", "worktree", "cwd", "model", "provider", "modelId", "thinking", "tools", "skills", "skillPaths", "extensions", "extensionPaths", "cursorModel", "permissionMode", "acpSessionId", "acpCapabilities", "sessionFile", "infoFile", "logFile", "responseFile", "viewerPaneId", "viewerTabId", "createdAt", "updatedAt", "currentTurnId", "nextOrdinal", "closed", "closedAt", "closeReason", "metrics"], path);
+	exactKeys(value, ["id", "taskName", "canonicalName", "backend", "parentSessionId", "parentSessionFile", "agentType", "isolation", "worktree", "cwd", "model", "provider", "modelId", "thinking", "tools", "skills", "skillPaths", "extensions", "extensionPaths", "cursorModel", "permissionMode", "acpSessionId", "acpCapabilities", "sessionFile", "infoFile", "logFile", "responseFile", "viewerPaneId", "viewerTabId", "createdAt", "updatedAt", "currentTurnId", "nextOrdinal", "closed", "closedAt", "closeReason", "metrics", "toolCallCount"], path);
 	return {
 		id: opaqueId(value.id, `${path}.id`), taskName: string(value.taskName, `${path}.taskName`), canonicalName: string(value.canonicalName, `${path}.canonicalName`), backend: enumValue(value.backend, ["pi", "cursor"] as const, `${path}.backend`),
 		parentSessionId: string(value.parentSessionId, `${path}.parentSessionId`), parentSessionFile: optionalString(value.parentSessionFile, `${path}.parentSessionFile`), agentType: optionalString(value.agentType, `${path}.agentType`), isolation: enumValue(value.isolation, ["shared", "worktree"] as const, `${path}.isolation`), worktree: parseWorktree(value.worktree, `${path}.worktree`), cwd: string(value.cwd, `${path}.cwd`), model: string(value.model, `${path}.model`),
 		provider: optionalString(value.provider, `${path}.provider`), modelId: optionalString(value.modelId, `${path}.modelId`), thinking: optionalString(value.thinking, `${path}.thinking`), tools: optionalString(value.tools, `${path}.tools`), skills: strings(value.skills, `${path}.skills`), skillPaths: strings(value.skillPaths, `${path}.skillPaths`), extensions: strings(value.extensions, `${path}.extensions`), extensionPaths: strings(value.extensionPaths, `${path}.extensionPaths`),
 		cursorModel: optionalString(value.cursorModel, `${path}.cursorModel`), permissionMode: enumValue(value.permissionMode, ["agent", "prompt", "allow-once", "deny"] as const, `${path}.permissionMode`), acpSessionId: optionalString(value.acpSessionId, `${path}.acpSessionId`), acpCapabilities: capabilities(value.acpCapabilities, `${path}.acpCapabilities`), sessionFile: optionalString(value.sessionFile, `${path}.sessionFile`),
 		infoFile: string(value.infoFile, `${path}.infoFile`), logFile: string(value.logFile, `${path}.logFile`), responseFile: string(value.responseFile, `${path}.responseFile`), viewerPaneId: optionalString(value.viewerPaneId, `${path}.viewerPaneId`), viewerTabId: optionalString(value.viewerTabId, `${path}.viewerTabId`),
-		createdAt: safeInt(value.createdAt, `${path}.createdAt`), updatedAt: safeInt(value.updatedAt, `${path}.updatedAt`), currentTurnId: optionalString(value.currentTurnId, `${path}.currentTurnId`), nextOrdinal: safeInt(value.nextOrdinal, `${path}.nextOrdinal`), closed: bool(value.closed, `${path}.closed`), closedAt: value.closedAt === undefined ? undefined : safeInt(value.closedAt, `${path}.closedAt`), closeReason: optionalString(value.closeReason, `${path}.closeReason`), metrics: parseMetrics(value.metrics, `${path}.metrics`),
+		createdAt: safeInt(value.createdAt, `${path}.createdAt`), updatedAt: safeInt(value.updatedAt, `${path}.updatedAt`), currentTurnId: optionalString(value.currentTurnId, `${path}.currentTurnId`), nextOrdinal: safeInt(value.nextOrdinal, `${path}.nextOrdinal`), closed: bool(value.closed, `${path}.closed`), closedAt: value.closedAt === undefined ? undefined : safeInt(value.closedAt, `${path}.closedAt`), closeReason: optionalString(value.closeReason, `${path}.closeReason`), metrics: parseMetrics(value.metrics, `${path}.metrics`), toolCallCount: safeInt(value.toolCallCount, `${path}.toolCallCount`),
 	};
 }
 
@@ -389,6 +399,15 @@ function assertWorktreeConfig(agent: ManifestAgent): void {
 	assert(/^pi-bstn\/[A-Za-z0-9_-]{1,64}\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}-[A-Za-z0-9_-]{1,8}-[A-Za-z0-9_-]{1,8}$/.test(worktree.branch), `worktree agent ${agent.id} branch is not package-owned`);
 	if (worktree.phase === "planned" || worktree.phase === "active") assert(worktree.reason === undefined && worktree.error === undefined && worktree.finalCommit === undefined && worktree.finalBranch === undefined && worktree.changedFiles === undefined && worktree.untrackedFiles === undefined, `active worktree agent ${agent.id} has retention fields`); else assert(worktree.reason !== undefined, `terminal worktree agent ${agent.id} requires a retention reason`);
 }
+const CODEX_CONVERSION_PACKAGE = "@howaboua/pi-codex-conversion";
+const CODEX_CHILD_GUARD_NAME = "pi-bstn-codex-child-guard";
+
+function hasCanonicalCodexNormalization(agent: ManifestAgent): boolean {
+	if (agent.backend !== "pi" || agent.provider !== "openai-codex" || agent.tools !== undefined || agent.extensions.length !== agent.extensionPaths.length || agent.extensions.length < 2) return false;
+	const last = agent.extensions.length - 1;
+	if (agent.extensions[0] !== CODEX_CONVERSION_PACKAGE || agent.extensions[last] !== CODEX_CHILD_GUARD_NAME || !agent.extensionPaths.every((path) => isAbsolute(path) && resolve(path) === path) || !agent.extensionPaths[last]!.endsWith(`${sep}codex-child-guard.ts`)) return false;
+	return agent.extensions.slice(1, -1).every((name, index) => name !== CODEX_CONVERSION_PACKAGE && name !== CODEX_CHILD_GUARD_NAME && agent.extensionPaths[index + 1] !== agent.extensionPaths[0] && agent.extensionPaths[index + 1] !== agent.extensionPaths[last]);
+}
 function assertExecutionMatchesAgent(turn: ManifestTurn, agent: ManifestAgent): void {
 	const execution = turn.execution;
 	assert(execution.backend === agent.backend, `turn ${turn.id} execution backend does not match agent`);
@@ -396,6 +415,18 @@ function assertExecutionMatchesAgent(turn: ManifestTurn, agent: ManifestAgent): 
 	assert(sameOptional(execution.provider, agent.provider) && sameOptional(execution.modelId, agent.modelId) && sameOptional(execution.thinking, agent.thinking) && sameOptional(execution.tools, agent.tools), `turn ${turn.id} execution Pi config does not match agent`);
 	assert(sameStrings(execution.skills, agent.skills) && sameStrings(execution.skillPaths, agent.skillPaths) && sameStrings(execution.extensions, agent.extensions) && sameStrings(execution.extensionPaths, agent.extensionPaths), `turn ${turn.id} execution arrays do not match agent`);
 	assert(sameOptional(execution.cursorModel, agent.cursorModel) && sameOptional(execution.permissionMode, agent.permissionMode) && sameOptional(execution.sessionFile, agent.sessionFile), `turn ${turn.id} execution Cursor/session config does not match agent`);
+}
+function assertTerminalExecutionMatchesAgent(turn: ManifestTurn, agent: ManifestAgent): void {
+	const execution = turn.execution;
+	assert(execution.backend === agent.backend, `turn ${turn.id} execution backend does not match agent`);
+	assert(execution.cwd === agent.cwd && execution.model === agent.model, `turn ${turn.id} execution cwd/model does not match agent`);
+	assert(sameOptional(execution.provider, agent.provider) && sameOptional(execution.modelId, agent.modelId) && sameOptional(execution.thinking, agent.thinking), `turn ${turn.id} execution Pi config does not match agent`);
+	assert(sameStrings(execution.skills, agent.skills) && sameStrings(execution.skillPaths, agent.skillPaths), `turn ${turn.id} execution arrays do not match agent`);
+	assert(sameOptional(execution.cursorModel, agent.cursorModel) && sameOptional(execution.permissionMode, agent.permissionMode) && sameOptional(execution.sessionFile, agent.sessionFile), `turn ${turn.id} execution Cursor/session config does not match agent`);
+	if (!hasCanonicalCodexNormalization(agent)) {
+		assert(sameOptional(execution.tools, agent.tools), `turn ${turn.id} execution Pi config does not match agent`);
+		assert(sameStrings(execution.extensions, agent.extensions) && sameStrings(execution.extensionPaths, agent.extensionPaths), `turn ${turn.id} execution arrays do not match agent`);
+	}
 }
 
 export function validateManifestPaths(manifest: ParentManifestV1, scopeDir: string): void {
@@ -436,7 +467,11 @@ export function validateManifest(manifest: ParentManifestV1): void {
 	}
 	for (const [key, turn] of Object.entries(manifest.turns)) {
 		assert(key === turn.id, `turn key ${key} does not match id`); opaqueId(turn.id, `turn ${turn.id}.id`); assert(manifest.agents[turn.agentId], `turn ${turn.id} references missing agent ${turn.agentId}`);
-		const agent = manifest.agents[turn.agentId]!; assertExecutionMatchesAgent(turn, agent);
+		const agent = manifest.agents[turn.agentId]!;
+		// A terminal turn is immutable. Only a syntactically canonical normalized Codex agent
+		// may retain its pre-conversion tools/extensions snapshot; every other field still binds.
+		if (turn.state === "terminal") assertTerminalExecutionMatchesAgent(turn, agent);
+		else assertExecutionMatchesAgent(turn, agent);
 		if (turn.source === "cursor-correction") assert(agent.backend === "cursor" && turn.execution.backend === "cursor" && turn.state !== "queued" && (turn.state !== "terminal" || turn.admittedAt !== undefined), `cursor correction turn ${turn.id} must have admitted Cursor history`);
 		assert(turn.sequence >= 1 && turn.sequence < manifest.nextSequence, `turn ${turn.id} sequence is out of range`);
 		assert(!sequences.has(turn.sequence), `duplicate sequence ${turn.sequence}`); sequences.add(turn.sequence);
@@ -487,7 +522,7 @@ export function addAgent(manifest: ParentManifestV1, input: AddAgentInput, now: 
 	assertMutationTime(manifest, now); assert(input.createdAt <= now && input.updatedAt <= now, `agent ${input.id} timestamps exceed mutation time`);
 	const next = clone(manifest); if (next.agents[input.id]) fail(`agent ${input.id} already exists`);
 	assert(input.parentSessionId === next.parentSessionId, `agent ${input.id} has another parent session`);
-	next.agents[input.id] = { ...clone(input), isolation: input.isolation ?? "shared", skills: [...input.skills], skillPaths: [...input.skillPaths], extensions: [...input.extensions], extensionPaths: [...input.extensionPaths], nextOrdinal: 1, currentTurnId: undefined, closed: input.closed ?? false };
+	next.agents[input.id] = { ...clone(input), toolCallCount: 0, isolation: input.isolation ?? "shared", skills: [...input.skills], skillPaths: [...input.skillPaths], extensions: [...input.extensions], extensionPaths: [...input.extensionPaths], nextOrdinal: 1, currentTurnId: undefined, closed: input.closed ?? false };
 	next.updatedAt = now; validateManifest(next); return next;
 }
 
@@ -495,6 +530,27 @@ export function addAgent(manifest: ParentManifestV1, input: AddAgentInput, now: 
 export function addAgentAtScope(manifest: ParentManifestV1, scopeDir: string, input: AddAgentInput, now: number): ParentManifestV1 {
 	const paths = canonicalAgentPaths(scopeDir, input.id);
 	return addAgent(manifest, { ...input, infoFile: paths.infoFile, logFile: paths.logFile, responseFile: paths.responseFile, sessionFile: input.backend === "pi" ? paths.sessionFile : undefined }, now);
+}
+
+/**
+ * Atomically updates only the mutable execution configuration of a settled, open Pi agent.
+ * Historical terminal turn snapshots deliberately remain untouched.
+ */
+export function normalizeSettledPiAgentExtensions(manifest: ParentManifestV1, agentId: string, extensions: string[], extensionPaths: string[], now: number): ParentManifestV1 {
+	const original = manifest.agents[agentId]; if (!original) fail(`agent ${agentId} does not exist`);
+	const current = original.currentTurnId ? manifest.turns[original.currentTurnId] : undefined;
+	assert(original.backend === "pi" && original.provider === "openai-codex", `agent ${agentId} is not an openai-codex Pi agent`);
+	assert(!original.closed, `agent ${agentId} is closed`);
+	assert(!!current && current.state === "terminal", `agent ${agentId} does not have a settled current turn`);
+	assertMutationTime(manifest, now, current); assert(now >= original.updatedAt, `mutation time precedes agent ${agentId} updatedAt`);
+	const checkedExtensions = strings(extensions, "settled Pi agent extensions"); const checkedPaths = strings(extensionPaths, "settled Pi agent extensionPaths");
+	assert(checkedExtensions.length === checkedPaths.length, `agent ${agentId} extension names and paths are misaligned`);
+	const candidate = { ...original, tools: undefined, extensions: checkedExtensions, extensionPaths: checkedPaths } as ManifestAgent;
+	assert(hasCanonicalCodexNormalization(candidate), `agent ${agentId} Codex extension normalization is not canonical`);
+	const next = clone(manifest); const agent = next.agents[agentId]!;
+	delete agent.tools;
+	agent.extensions = [...checkedExtensions]; agent.extensionPaths = [...checkedPaths]; agent.updatedAt = now; next.updatedAt = now;
+	validateManifest(next); return next;
 }
 
 export function enqueueTurn(manifest: ParentManifestV1, input: EnqueueTurnInput): ParentManifestV1 {
@@ -572,6 +628,16 @@ export function updateAgentRuntimeResources(manifest: ParentManifestV1, agentId:
 	agent.updatedAt = now; next.updatedAt = now; validateManifest(next); return next;
 }
 
+/** Atomically counts one accepted tool start for the agent's current live turn. */
+export function incrementAgentToolCallCount(manifest: ParentManifestV1, agentId: string, expectedTurnId: string, now: number): ParentManifestV1 {
+	const agent = manifest.agents[agentId]; if (!agent) fail(`agent ${agentId} does not exist`);
+	const turn = manifest.turns[expectedTurnId]; if (!turn || turn.agentId !== agentId || agent.currentTurnId !== expectedTurnId) fail(`turn ${expectedTurnId} is not the agent current turn`);
+	if (turn.state !== "running") fail(`turn ${expectedTurnId} is not running`);
+	assertMutationTime(manifest, now, turn); assert(now >= agent.updatedAt, `mutation time precedes agent ${agentId} updatedAt`);
+	if (agent.toolCallCount >= Number.MAX_SAFE_INTEGER) fail(`agent ${agentId} toolCallCount exceeds safe integer`);
+	const next = clone(manifest); next.agents[agentId]!.toolCallCount++; next.agents[agentId]!.updatedAt = now; next.turns[expectedTurnId]!.lastActivityAt = now; next.updatedAt = now; validateManifest(next); return next;
+}
+
 /** Narrow Pi-only metrics mutation. It cannot carry identity, files, prompts, or textual payloads. */
 export function updateAgentMetrics(manifest: ParentManifestV1, agentId: string, metrics: AgentMetrics, now: number): ParentManifestV1 {
 	const agent = manifest.agents[agentId]; if (!agent) fail(`agent ${agentId} does not exist`); assert(agent.backend === "pi", `agent ${agentId} metrics are Pi-only`); assertMutationTime(manifest, now); assert(now >= agent.updatedAt, `mutation time precedes agent ${agentId} updatedAt`);
@@ -644,7 +710,7 @@ export function projectAgent(agent: ManifestAgent, turn: ManifestTurn | undefine
 		id: agent.id, taskName: agent.taskName, canonicalName: agent.canonicalName, backend: agent.backend, parentSessionId: agent.parentSessionId, parentSessionFile: agent.parentSessionFile, agentType: agent.agentType, cwd: agent.cwd, model: agent.model, provider: agent.provider, modelId: agent.modelId, thinking: agent.thinking, tools: agent.tools,
 		isolation: agent.isolation, worktree: agent.worktree ? clone(agent.worktree) : undefined, skills: [...agent.skills], skillPaths: [...agent.skillPaths], extensions: [...agent.extensions], extensionPaths: [...agent.extensionPaths], cursorModel: agent.cursorModel, permissionMode: agent.permissionMode, acpSessionId: agent.acpSessionId, acpCapabilities: agent.acpCapabilities ? { ...agent.acpCapabilities } : undefined, sessionFile: agent.sessionFile,
 		infoFile: agent.infoFile, logFile: agent.logFile, responseFile: agent.responseFile, viewerPaneId: agent.viewerPaneId, viewerTabId: agent.viewerTabId, createdAt: agent.createdAt, updatedAt: agent.updatedAt, startedAt: turn?.startedAt ?? turn?.admittedAt, completedAt: turn?.completedAt, closedAt: agent.closedAt, lastActivity: turn?.lastActivityAt ?? agent.updatedAt, turn: turn?.ordinal ?? Math.max(0, agent.nextOrdinal - 1), status, lastTaskMessage: turn?.execution.displayMessage, error: turn?.error, currentTurnId: agent.currentTurnId, terminalReason: turn?.terminalReason,
-		response: turn?.response ? { ...turn.response } : undefined, finalResponse: turn?.response ? options.readResponse?.(turn.response) : undefined, metrics: agent.metrics ? { ...agent.metrics, ...(agent.metrics.contextUsage ? { contextUsage: { ...agent.metrics.contextUsage } } : {}) } : undefined,
+		response: turn?.response ? { ...turn.response } : undefined, finalResponse: turn?.response ? options.readResponse?.(turn.response) : undefined, toolCallCount: agent.toolCallCount, metrics: agent.metrics ? { ...agent.metrics, ...(agent.metrics.contextUsage ? { contextUsage: { ...agent.metrics.contextUsage } } : {}) } : undefined,
 	};
 }
 export function materializeAgentProjections(manifest: ParentManifestV1, options: ProjectionOptions = {}): AgentInfoProjection[] {
